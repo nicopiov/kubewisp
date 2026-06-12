@@ -5,9 +5,12 @@ import (
 	"fmt"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
+	appsv1 "k8s.io/api/apps/v1"
 	batchv1 "k8s.io/api/batch/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/client-go/kubernetes"
 )
@@ -20,6 +23,8 @@ const (
 type WorkloadService interface {
 	List(ctx context.Context, namespace string) ([]WorkloadSummary, error)
 	RolloutRestart(ctx context.Context, namespace, kind, name string) error
+	Describe(ctx context.Context, namespace, kind, name string) (WorkloadDetails, error)
+	Pods(ctx context.Context, namespace, kind, name string) ([]PodSummary, error)
 	DescribeCronJob(ctx context.Context, namespace, name string) (CronJobDetails, error)
 	SetCronJobSuspended(ctx context.Context, namespace, name string, suspended bool) error
 }
@@ -48,6 +53,22 @@ type CronJobDetails struct {
 	Jobs                   []JobSummary
 }
 
+type WorkloadDetails struct {
+	WorkloadSummary
+	Strategy       string
+	Selector       string
+	ServiceAccount string
+	Containers     []string
+	Conditions     []WorkloadCondition
+}
+
+type WorkloadCondition struct {
+	Type    string
+	Status  string
+	Reason  string
+	Message string
+}
+
 type JobSummary struct {
 	Name           string
 	Status         string
@@ -65,7 +86,7 @@ type Workloads struct {
 }
 
 func NewWorkloadService() *Workloads {
-	return &Workloads{factory: KubeconfigClientFactory{}, now: time.Now}
+	return &Workloads{factory: NewKubeconfigClientFactory(), now: time.Now}
 }
 
 func NewWorkloadServiceWithFactory(factory ClientFactory) *Workloads {
@@ -77,21 +98,41 @@ func (s *Workloads) List(ctx context.Context, namespace string) ([]WorkloadSumma
 	if err != nil {
 		return nil, err
 	}
-	deployments, err := client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, diagnose(fmt.Sprintf("list deployments in namespace %q", namespace), err)
+	var deployments *appsv1.DeploymentList
+	var statefulSets *appsv1.StatefulSetList
+	var daemonSets *appsv1.DaemonSetList
+	var cronJobs *batchv1.CronJobList
+	var deploymentErr, statefulSetErr, daemonSetErr, cronJobErr error
+	var wait sync.WaitGroup
+	wait.Add(4)
+	go func() {
+		defer wait.Done()
+		deployments, deploymentErr = client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
+	}()
+	go func() {
+		defer wait.Done()
+		statefulSets, statefulSetErr = client.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
+	}()
+	go func() {
+		defer wait.Done()
+		daemonSets, daemonSetErr = client.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
+	}()
+	go func() {
+		defer wait.Done()
+		cronJobs, cronJobErr = client.BatchV1().CronJobs(namespace).List(ctx, metav1.ListOptions{})
+	}()
+	wait.Wait()
+	if deploymentErr != nil {
+		return nil, diagnose(fmt.Sprintf("list deployments in namespace %q", namespace), deploymentErr)
 	}
-	statefulSets, err := client.AppsV1().StatefulSets(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, diagnose(fmt.Sprintf("list statefulsets in namespace %q", namespace), err)
+	if statefulSetErr != nil {
+		return nil, diagnose(fmt.Sprintf("list statefulsets in namespace %q", namespace), statefulSetErr)
 	}
-	daemonSets, err := client.AppsV1().DaemonSets(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, diagnose(fmt.Sprintf("list daemonsets in namespace %q", namespace), err)
+	if daemonSetErr != nil {
+		return nil, diagnose(fmt.Sprintf("list daemonsets in namespace %q", namespace), daemonSetErr)
 	}
-	cronJobs, err := client.BatchV1().CronJobs(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, diagnose(fmt.Sprintf("list cronjobs in namespace %q", namespace), err)
+	if cronJobErr != nil {
+		return nil, diagnose(fmt.Sprintf("list cronjobs in namespace %q", namespace), cronJobErr)
 	}
 
 	var workloads []WorkloadSummary
@@ -147,6 +188,135 @@ func SupportsRolloutRestart(kind string) bool {
 	default:
 		return false
 	}
+}
+
+func (s *Workloads) Describe(ctx context.Context, namespace, kind, name string) (WorkloadDetails, error) {
+	client, err := s.client()
+	if err != nil {
+		return WorkloadDetails{}, err
+	}
+	switch strings.ToLower(kind) {
+	case "deployment", "deployments":
+		item, err := client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadDetails{}, diagnose(fmt.Sprintf("get deployment %q in namespace %q", name, namespace), err)
+		}
+		details := WorkloadDetails{
+			WorkloadSummary: WorkloadSummary{
+				Kind: "Deployment", Name: item.Name, Ready: item.Status.ReadyReplicas,
+				Desired: desiredReplicas(item.Spec.Replicas), Updated: item.Status.UpdatedReplicas,
+				Available: item.Status.AvailableReplicas, CreatedAt: item.CreationTimestamp.Time,
+			},
+			Strategy:       string(item.Spec.Strategy.Type),
+			Selector:       metav1.FormatLabelSelector(item.Spec.Selector),
+			ServiceAccount: item.Spec.Template.Spec.ServiceAccountName,
+			Containers:     templateContainers(item.Spec.Template.Spec.Containers),
+		}
+		for _, condition := range item.Status.Conditions {
+			details.Conditions = append(details.Conditions, WorkloadCondition{
+				Type: string(condition.Type), Status: string(condition.Status),
+				Reason: condition.Reason, Message: condition.Message,
+			})
+		}
+		return details, nil
+	case "statefulset", "statefulsets":
+		item, err := client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadDetails{}, diagnose(fmt.Sprintf("get statefulset %q in namespace %q", name, namespace), err)
+		}
+		details := WorkloadDetails{
+			WorkloadSummary: WorkloadSummary{
+				Kind: "StatefulSet", Name: item.Name, Ready: item.Status.ReadyReplicas,
+				Desired: desiredReplicas(item.Spec.Replicas), Updated: item.Status.UpdatedReplicas,
+				Available: item.Status.AvailableReplicas, CreatedAt: item.CreationTimestamp.Time,
+			},
+			Strategy:       string(item.Spec.UpdateStrategy.Type),
+			Selector:       metav1.FormatLabelSelector(item.Spec.Selector),
+			ServiceAccount: item.Spec.Template.Spec.ServiceAccountName,
+			Containers:     templateContainers(item.Spec.Template.Spec.Containers),
+		}
+		for _, condition := range item.Status.Conditions {
+			details.Conditions = append(details.Conditions, WorkloadCondition{
+				Type: string(condition.Type), Status: string(condition.Status),
+				Reason: condition.Reason, Message: condition.Message,
+			})
+		}
+		return details, nil
+	case "daemonset", "daemonsets":
+		item, err := client.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadDetails{}, diagnose(fmt.Sprintf("get daemonset %q in namespace %q", name, namespace), err)
+		}
+		details := WorkloadDetails{
+			WorkloadSummary: WorkloadSummary{
+				Kind: "DaemonSet", Name: item.Name, Ready: item.Status.NumberReady,
+				Desired: item.Status.DesiredNumberScheduled, Updated: item.Status.UpdatedNumberScheduled,
+				Available: item.Status.NumberAvailable, CreatedAt: item.CreationTimestamp.Time,
+			},
+			Strategy:       string(item.Spec.UpdateStrategy.Type),
+			Selector:       metav1.FormatLabelSelector(item.Spec.Selector),
+			ServiceAccount: item.Spec.Template.Spec.ServiceAccountName,
+			Containers:     templateContainers(item.Spec.Template.Spec.Containers),
+		}
+		for _, condition := range item.Status.Conditions {
+			details.Conditions = append(details.Conditions, WorkloadCondition{
+				Type: string(condition.Type), Status: string(condition.Status),
+				Reason: condition.Reason, Message: condition.Message,
+			})
+		}
+		return details, nil
+	default:
+		return WorkloadDetails{}, fmt.Errorf("workload kind %q does not have replica workload details", kind)
+	}
+}
+
+func (s *Workloads) Pods(ctx context.Context, namespace, kind, name string) ([]PodSummary, error) {
+	client, err := s.client()
+	if err != nil {
+		return nil, err
+	}
+	var selector *metav1.LabelSelector
+	switch strings.ToLower(kind) {
+	case "deployment", "deployments":
+		item, err := client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, diagnose(fmt.Sprintf("get deployment %q in namespace %q", name, namespace), err)
+		}
+		selector = item.Spec.Selector
+	case "statefulset", "statefulsets":
+		item, err := client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, diagnose(fmt.Sprintf("get statefulset %q in namespace %q", name, namespace), err)
+		}
+		selector = item.Spec.Selector
+	case "daemonset", "daemonsets":
+		item, err := client.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return nil, diagnose(fmt.Sprintf("get daemonset %q in namespace %q", name, namespace), err)
+		}
+		selector = item.Spec.Selector
+	default:
+		return nil, fmt.Errorf("workload kind %q does not manage a pod set", kind)
+	}
+	if selector == nil {
+		return nil, fmt.Errorf("%s/%s does not define a pod selector", kind, name)
+	}
+	labelSelector, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		return nil, fmt.Errorf("build pod selector for %s/%s: %w", kind, name, err)
+	}
+	list, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector.String()})
+	if err != nil {
+		return nil, diagnose(fmt.Sprintf("list pods for %s/%s in namespace %q", kind, name, namespace), err)
+	}
+	pods := make([]PodSummary, 0, len(list.Items))
+	for index := range list.Items {
+		pods = append(pods, summarizePod(&list.Items[index]))
+	}
+	sort.Slice(pods, func(i, j int) bool {
+		return pods[i].Name < pods[j].Name
+	})
+	return pods, nil
 }
 
 func (s *Workloads) DescribeCronJob(ctx context.Context, namespace, name string) (CronJobDetails, error) {
@@ -326,6 +496,14 @@ func desiredReplicas(replicas *int32) int32 {
 		return 1
 	}
 	return *replicas
+}
+
+func templateContainers(containers []corev1.Container) []string {
+	values := make([]string, 0, len(containers))
+	for _, container := range containers {
+		values = append(values, container.Name+" | image="+container.Image)
+	}
+	return values
 }
 
 func timeValue(value *metav1.Time) time.Time {

@@ -23,6 +23,7 @@ type Runner struct {
 	namespaces   kube.NamespaceService
 	pods         kube.PodService
 	workloads    kube.WorkloadService
+	network      kube.NetworkService
 	events       kube.EventService
 	doctor       doctor.Reporter
 	portForward  kubectl.PortForwarder
@@ -34,6 +35,7 @@ func NewRunner(
 	namespaces kube.NamespaceService,
 	pods kube.PodService,
 	workloads kube.WorkloadService,
+	network kube.NetworkService,
 	events kube.EventService,
 	doctorReporter doctor.Reporter,
 	portForwarder kubectl.PortForwarder,
@@ -44,6 +46,7 @@ func NewRunner(
 		namespaces:   namespaces,
 		pods:         pods,
 		workloads:    workloads,
+		network:      network,
 		events:       events,
 		doctor:       doctorReporter,
 		portForward:  portForwarder,
@@ -76,6 +79,7 @@ func (r *Runner) Run(ctx context.Context, input io.Reader, output io.Writer, con
 		Namespaces:   r.namespaces,
 		Pods:         r.pods,
 		Workloads:    r.workloads,
+		Network:      r.network,
 		Events:       r.events,
 		Doctor:       r.doctor,
 		PortForward:  r.portForward,

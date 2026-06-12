@@ -51,6 +51,20 @@ func (f *fakeWorkloads) DescribeCronJob(_ context.Context, namespace, name strin
 	return f.details, nil
 }
 
+func (f *fakeWorkloads) Describe(_ context.Context, namespace, kind, name string) (kube.WorkloadDetails, error) {
+	f.namespace = namespace
+	f.kind = kind
+	f.name = name
+	return kube.WorkloadDetails{}, nil
+}
+
+func (f *fakeWorkloads) Pods(_ context.Context, namespace, kind, name string) ([]kube.PodSummary, error) {
+	f.namespace = namespace
+	f.kind = kind
+	f.name = name
+	return nil, nil
+}
+
 func (f *fakeWorkloads) SetCronJobSuspended(_ context.Context, namespace, name string, suspended bool) error {
 	f.namespace = namespace
 	f.name = name

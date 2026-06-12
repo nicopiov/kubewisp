@@ -30,7 +30,7 @@ type Events struct {
 }
 
 func NewEventService() *Events {
-	return &Events{factory: KubeconfigClientFactory{}}
+	return &Events{factory: NewKubeconfigClientFactory()}
 }
 
 func NewEventServiceWithFactory(factory ClientFactory) *Events {

@@ -23,6 +23,7 @@ const (
 	namespaceScreen
 	podScreen
 	workloadScreen
+	networkScreen
 	eventScreen
 	doctorScreen
 	podDetailsScreen
@@ -33,6 +34,9 @@ const (
 	execConfirmScreen
 	podActionConfirmScreen
 	workloadRestartConfirmScreen
+	workloadDetailsScreen
+	workloadPodsScreen
+	networkDetailsScreen
 	cronJobDetailsScreen
 	cronJobStateConfirmScreen
 )
@@ -45,6 +49,7 @@ type Dependencies struct {
 	Namespaces   kube.NamespaceService
 	Pods         kube.PodService
 	Workloads    kube.WorkloadService
+	Network      kube.NetworkService
 	Events       kube.EventService
 	Doctor       doctor.Reporter
 	PortForward  kubectl.PortForwarder
@@ -61,6 +66,9 @@ type Model struct {
 	loading      bool
 	status       string
 	err          error
+	loadedAt     map[screen]time.Time
+	cacheTTL     time.Duration
+	now          func() time.Time
 
 	connectivity      kube.ConnectivityReport
 	namespaces        []string
@@ -75,14 +83,20 @@ type Model struct {
 	doctorConnectErr  error
 	ports             []kube.PodPort
 	workloads         []kube.WorkloadSummary
+	workloadPods      []kube.PodSummary
+	networkResources  []kube.NetworkSummary
+	selectedNetwork   kube.NetworkSummary
+	networkDetails    kube.NetworkDetails
 	events            []kube.NamespaceEventSummary
 	selectedWorkload  kube.WorkloadSummary
+	workloadDetails   kube.WorkloadDetails
 	cronJobDetails    kube.CronJobDetails
 	pendingWorkload   kube.NamespaceEventSummary
 	podAction         string
 	podActionInfo     kube.PodActionInfo
 	confirmationInput string
 	cronJobSuspended  bool
+	podBackScreen     screen
 }
 
 type connectivityMsg struct {
@@ -154,6 +168,21 @@ type workloadsMsg struct {
 	err       error
 }
 
+type workloadPodsMsg struct {
+	pods []kube.PodSummary
+	err  error
+}
+
+type networkMsg struct {
+	resources []kube.NetworkSummary
+	err       error
+}
+
+type networkDetailsMsg struct {
+	details kube.NetworkDetails
+	err     error
+}
+
 type eventsMsg struct {
 	events []kube.NamespaceEventSummary
 	err    error
@@ -165,6 +194,11 @@ type workloadRestartedMsg struct {
 
 type cronJobDetailsMsg struct {
 	details kube.CronJobDetails
+	err     error
+}
+
+type workloadDetailsMsg struct {
+	details kube.WorkloadDetails
 	err     error
 }
 
@@ -183,7 +217,10 @@ var (
 )
 
 func NewModel(dependencies Dependencies) Model {
-	return Model{dependencies: dependencies, loading: true}
+	return Model{
+		dependencies: dependencies, loading: true, podBackScreen: podScreen,
+		loadedAt: make(map[screen]time.Time), cacheTTL: 15 * time.Second, now: time.Now,
+	}
 }
 
 func (m Model) Init() tea.Cmd {
@@ -206,11 +243,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = message.err
 		m.namespaces = message.names
+		m.markLoaded(namespaceScreen)
 		m.clampCursor(len(m.namespaces))
 	case podsMsg:
 		m.loading = false
 		m.err = message.err
 		m.pods = message.pods
+		m.markLoaded(podScreen)
 		m.clampCursor(len(m.pods))
 	case workloadsMsg:
 		m.loading = false
@@ -228,16 +267,34 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.pendingWorkload = kube.NamespaceEventSummary{}
 		}
 		m.clampCursor(len(m.workloads))
+		m.markLoaded(workloadScreen)
+	case workloadPodsMsg:
+		m.loading = false
+		m.err = message.err
+		m.workloadPods = message.pods
+		m.clampCursor(len(m.workloadPods))
+	case networkMsg:
+		m.loading = false
+		m.err = message.err
+		m.networkResources = message.resources
+		m.markLoaded(networkScreen)
+		m.clampCursor(len(m.networkResources))
+	case networkDetailsMsg:
+		m.loading = false
+		m.err = message.err
+		m.networkDetails = message.details
 	case eventsMsg:
 		m.loading = false
 		m.err = message.err
 		m.events = message.events
+		m.markLoaded(eventScreen)
 		m.clampCursor(len(m.events))
 	case namespaceSwitchedMsg:
 		m.loading = false
 		m.err = message.err
 		if message.err == nil {
 			m.dependencies.Profile.CurrentNamespace = message.namespace
+			m.loadedAt = make(map[screen]time.Time)
 			m.status = fmt.Sprintf("Namespace switched to %s", message.namespace)
 		}
 	case podDetailsMsg:
@@ -270,6 +327,7 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.doctorReport = message.report
 		m.doctorConnection = message.connection
 		m.doctorConnectErr = message.connectionErr
+		m.markLoaded(doctorScreen)
 	case portsMsg:
 		m.loading = false
 		m.err = message.err
@@ -326,6 +384,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = message.err
 		m.cronJobDetails = message.details
+	case workloadDetailsMsg:
+		m.loading = false
+		m.err = message.err
+		m.workloadDetails = message.details
 	case cronJobStateMsg:
 		m.loading = false
 		m.err = message.err
@@ -395,8 +457,15 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.isNestedScreen() {
 			if m.screen == workloadRestartConfirmScreen {
 				m.screen = workloadScreen
-			} else if m.screen == cronJobDetailsScreen || m.screen == cronJobStateConfirmScreen {
+			} else if m.screen == networkDetailsScreen {
+				m.screen = networkScreen
+			} else if m.screen == workloadDetailsScreen || m.screen == cronJobDetailsScreen ||
+				m.screen == cronJobStateConfirmScreen {
 				m.screen = workloadScreen
+			} else if m.screen == workloadPodsScreen {
+				m.screen = workloadDetailsScreen
+			} else if m.screen == podDetailsScreen || m.screen == podLogsScreen || m.screen == containerScreen {
+				m.screen = m.podBackScreen
 			} else {
 				m.screen = podScreen
 			}
@@ -416,19 +485,22 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "4":
 		return m.changeScreen(workloadScreen)
 	case "5":
-		return m.changeScreen(eventScreen)
+		return m.changeScreen(networkScreen)
 	case "6":
+		return m.changeScreen(eventScreen)
+	case "7":
 		return m.changeScreen(doctorScreen)
 	case "tab", "right":
 		if !m.isNestedScreen() {
-			return m.changeScreen((m.screen + 1) % 6)
+			return m.changeScreen((m.screen + 1) % 7)
 		}
 	case "shift+tab", "left":
 		if !m.isNestedScreen() {
-			return m.changeScreen((m.screen + 5) % 6)
+			return m.changeScreen((m.screen + 6) % 7)
 		}
 	case "up", "k":
-		if m.screen == podDetailsScreen || m.screen == podLogsScreen || m.screen == cronJobDetailsScreen {
+		if m.screen == podDetailsScreen || m.screen == podLogsScreen ||
+			m.screen == workloadDetailsScreen || m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
 			if m.scroll > 0 {
 				m.scroll--
 			}
@@ -438,7 +510,8 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor--
 		}
 	case "down", "j":
-		if m.screen == podDetailsScreen || m.screen == podLogsScreen || m.screen == cronJobDetailsScreen {
+		if m.screen == podDetailsScreen || m.screen == podLogsScreen ||
+			m.screen == workloadDetailsScreen || m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
 			m.scroll++
 			return m, nil
 		}
@@ -446,14 +519,22 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.cursor++
 		}
 	case "r":
+		delete(m.loadedAt, m.screen)
 		m.loading = true
 		m.status = ""
 		m.err = nil
 		return m, m.loadCurrent()
 	case "l":
-		if (m.screen == podScreen && len(m.pods) > 0) || m.screen == podDetailsScreen {
+		if (m.screen == podScreen && len(m.pods) > 0) ||
+			(m.screen == workloadPodsScreen && len(m.workloadPods) > 0) ||
+			m.screen == podDetailsScreen {
 			if m.screen == podScreen {
 				m.selectedPod = m.pods[m.cursor].Name
+				m.podBackScreen = podScreen
+			}
+			if m.screen == workloadPodsScreen {
+				m.selectedPod = m.workloadPods[m.cursor].Name
+				m.podBackScreen = workloadPodsScreen
 			}
 			m.screen = containerScreen
 			m.cursor = 0
@@ -462,6 +543,13 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.loadContainers()
 		}
 	case "p":
+		if m.screen == workloadDetailsScreen {
+			m.screen = workloadPodsScreen
+			m.cursor = 0
+			m.scroll = 0
+			m.loading = true
+			return m, m.loadWorkloadPods()
+		}
 		if (m.screen == podScreen && len(m.pods) > 0) || m.screen == podDetailsScreen {
 			if m.screen == podScreen {
 				m.selectedPod = m.pods[m.cursor].Name
@@ -488,8 +576,10 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.beginPodAction("delete")
 		}
 	case "R":
-		if m.screen == workloadScreen && len(m.workloads) > 0 {
-			m.selectedWorkload = m.workloads[m.cursor]
+		if (m.screen == workloadScreen && len(m.workloads) > 0) || m.screen == workloadDetailsScreen {
+			if m.screen == workloadScreen {
+				m.selectedWorkload = m.workloads[m.cursor]
+			}
 			if !kube.SupportsRolloutRestart(m.selectedWorkload.Kind) {
 				m.status = fmt.Sprintf("%s does not support rollout restart", m.selectedWorkload.Kind)
 				return m, nil
@@ -536,6 +626,15 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 		if m.screen == podScreen && len(m.pods) > 0 {
 			m.selectedPod = m.pods[m.cursor].Name
+			m.podBackScreen = podScreen
+			m.screen = podDetailsScreen
+			m.scroll = 0
+			m.loading = true
+			return m, m.loadPodDetails()
+		}
+		if m.screen == workloadPodsScreen && len(m.workloadPods) > 0 {
+			m.selectedPod = m.workloadPods[m.cursor].Name
+			m.podBackScreen = workloadPodsScreen
 			m.screen = podDetailsScreen
 			m.scroll = 0
 			m.loading = true
@@ -549,12 +648,24 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.loading = true
 				return m, m.loadCronJobDetails()
 			}
+			m.screen = workloadDetailsScreen
+			m.scroll = 0
+			m.loading = true
+			return m, m.loadWorkloadDetails()
+		}
+		if m.screen == networkScreen && len(m.networkResources) > 0 {
+			m.selectedNetwork = m.networkResources[m.cursor]
+			m.screen = networkDetailsScreen
+			m.scroll = 0
+			m.loading = true
+			return m, m.loadNetworkDetails()
 		}
 		if m.screen == eventScreen && len(m.events) > 0 {
 			event := m.events[m.cursor]
 			switch strings.ToLower(event.ObjectKind) {
 			case "pod":
 				m.selectedPod = event.ObjectName
+				m.podBackScreen = podScreen
 				m.screen = podDetailsScreen
 				m.scroll = 0
 				m.loading = true
@@ -615,9 +726,12 @@ func (m Model) changeScreen(next screen) (tea.Model, tea.Cmd) {
 	m.screen = next
 	m.cursor = 0
 	m.scroll = 0
-	m.loading = true
+	m.loading = !m.cacheFresh(next)
 	m.status = ""
 	m.err = nil
+	if !m.loading {
+		return m, nil
+	}
 	return m, m.loadCurrent()
 }
 
@@ -641,8 +755,12 @@ func (m Model) View() string {
 			view.WriteString(m.namespaceView())
 		case podScreen:
 			view.WriteString(m.podView())
+		case workloadPodsScreen:
+			view.WriteString(m.workloadPodsView())
 		case workloadScreen:
 			view.WriteString(m.workloadView())
+		case networkScreen:
+			view.WriteString(m.networkView())
 		case eventScreen:
 			view.WriteString(m.eventView())
 		case doctorScreen:
@@ -663,6 +781,10 @@ func (m Model) View() string {
 			view.WriteString(m.podActionConfirmView())
 		case workloadRestartConfirmScreen:
 			view.WriteString(m.workloadRestartConfirmView())
+		case workloadDetailsScreen:
+			view.WriteString(m.scrollView(m.workloadDetailsView()))
+		case networkDetailsScreen:
+			view.WriteString(m.scrollView(m.networkDetailsView()))
 		case cronJobDetailsScreen:
 			view.WriteString(m.scrollView(m.cronJobDetailsView()))
 		case cronJobStateConfirmScreen:
@@ -698,7 +820,7 @@ func (m Model) header() string {
 }
 
 func (m Model) tabs() string {
-	labels := []string{"Dashboard", "Namespaces", "Pods", "Workloads", "Events", "Doctor"}
+	labels := []string{"Dashboard", "Namespaces", "Pods", "Workloads", "Network", "Events", "Doctor"}
 	for index := range labels {
 		if screen(index) == m.screen {
 			labels[index] = activeTabStyle.Render("[" + labels[index] + "]")
@@ -736,6 +858,15 @@ func (m Model) helpView() string {
 			}
 			return "y confirm rollout restart | esc cancel | q quit"
 		}
+		if m.screen == workloadDetailsScreen {
+			return "p managed pods | R rollout restart | r refresh | esc back | q quit"
+		}
+		if m.screen == workloadPodsScreen {
+			return "enter details | l logs | up/down navigate | r refresh | esc back | q quit"
+		}
+		if m.screen == networkDetailsScreen {
+			return "r refresh | esc back | q quit"
+		}
 		if m.screen == cronJobDetailsScreen {
 			return "s suspend/resume | r refresh | esc back | q quit"
 		}
@@ -754,12 +885,15 @@ func (m Model) helpView() string {
 		return "enter details | l logs | p port-forward | e exec | d delete | R restart | up/down navigate | r refresh | q quit"
 	}
 	if m.screen == workloadScreen {
-		return "enter CronJob details | s suspend/resume CronJob | R rollout restart | up/down navigate | r refresh | q quit"
+		return m.workloadHelpView()
 	}
 	if m.screen == eventScreen {
 		return "enter inspect affected object | up/down navigate | r refresh | tab/left/right screens | q quit"
 	}
-	return "1 dashboard | 2 namespaces | 3 pods | 4 workloads | 5 events | 6 doctor | tab/left/right screens | r refresh | q quit"
+	if m.screen == networkScreen {
+		return "enter details | up/down navigate | r refresh | tab/left/right screens | q quit"
+	}
+	return "1 dashboard | 2 namespaces | 3 pods | 4 workloads | 5 network | 6 events | 7 doctor | tab/left/right screens | r refresh | q quit"
 }
 
 func (m Model) dashboardView() string {
@@ -833,11 +967,25 @@ func (m Model) podView() string {
 	if len(m.pods) == 0 {
 		return fmt.Sprintf("No pods found in namespace %s.", selectedNamespace(m.dependencies.Profile))
 	}
+	return podListView(m.pods, m.cursor)
+}
+
+func (m Model) workloadPodsView() string {
+	if len(m.workloadPods) == 0 {
+		return fmt.Sprintf("No pods found for %s.", workloadReference(m.selectedWorkload))
+	}
+	var view strings.Builder
+	fmt.Fprintf(&view, "Pods managed by %s\n\n", workloadReference(m.selectedWorkload))
+	view.WriteString(podListView(m.workloadPods, m.cursor))
+	return view.String()
+}
+
+func podListView(pods []kube.PodSummary, cursorIndex int) string {
 	var view strings.Builder
 	fmt.Fprintln(&view, "  HEALTH | NAME | READY | STATUS | RESTARTS | AGE")
-	for index, pod := range m.pods {
+	for index, pod := range pods {
 		cursor := "  "
-		if index == m.cursor {
+		if index == cursorIndex {
 			cursor = "> "
 		}
 		fmt.Fprintf(
@@ -878,6 +1026,38 @@ func (m Model) workloadView() string {
 			formatAge(time.Now(), workload.LastScheduleTime),
 			formatAge(time.Now(), workload.CreatedAt),
 		)
+	}
+	return view.String()
+}
+
+func (m Model) workloadHelpView() string {
+	if len(m.workloads) == 0 || m.cursor >= len(m.workloads) {
+		return "r refresh | tab/left/right screens | q quit"
+	}
+	if strings.EqualFold(m.workloads[m.cursor].Kind, "CronJob") {
+		return "enter details | s suspend/resume | up/down navigate | r refresh | q quit"
+	}
+	return "enter details | R rollout restart | up/down navigate | r refresh | q quit"
+}
+
+func (m Model) networkView() string {
+	if len(m.networkResources) == 0 {
+		return fmt.Sprintf("No Services or Ingresses found in namespace %s.", selectedNamespace(m.dependencies.Profile))
+	}
+	var view strings.Builder
+	fmt.Fprintln(&view, "  KIND | NAME | TYPE/CLASS | ADDRESS | PORTS/HOSTS | AGE")
+	for index, resource := range m.networkResources {
+		cursor := "  "
+		if index == m.cursor {
+			cursor = "> "
+		}
+		exposure := strings.Join(resource.Ports, ", ")
+		if resource.Kind == "Ingress" {
+			exposure = strings.Join(resource.Hosts, ", ")
+		}
+		fmt.Fprintf(&view, "%s%s | %s | %s | %s | %s | %s\n",
+			cursor, resource.Kind, resource.Name, resource.Type, valueOrDash(resource.Address),
+			valueOrDash(exposure), formatAge(time.Now(), resource.CreatedAt))
 	}
 	return view.String()
 }
@@ -1107,6 +1287,56 @@ func (m Model) workloadRestartConfirmView() string {
 	return view.String()
 }
 
+func (m Model) workloadDetailsView() string {
+	details := m.workloadDetails
+	var view strings.Builder
+	fmt.Fprintf(&view, "%s Details: %s\n\n", details.Kind, details.Name)
+	fmt.Fprintf(&view, "Health: %s\n", workloadStatusMarker(details.WorkloadSummary))
+	fmt.Fprintf(
+		&view,
+		"Ready: %d/%d | Updated: %d | Available: %d | Age: %s\n",
+		details.Ready,
+		details.Desired,
+		details.Updated,
+		details.Available,
+		formatAge(time.Now(), details.CreatedAt),
+	)
+	fmt.Fprintf(&view, "Strategy: %s\n", valueOrDash(details.Strategy))
+	fmt.Fprintf(&view, "Selector: %s\n", valueOrDash(details.Selector))
+	fmt.Fprintf(&view, "Service Account: %s\n", valueOrDash(details.ServiceAccount))
+	writeDetailSection(&view, "Pod Template Containers", details.Containers)
+	fmt.Fprintln(&view, "\nConditions:")
+	if len(details.Conditions) == 0 {
+		fmt.Fprintln(&view, "  -")
+	}
+	for _, condition := range details.Conditions {
+		fmt.Fprintf(
+			&view,
+			"  %s=%s | reason=%s | %s\n",
+			condition.Type,
+			condition.Status,
+			valueOrDash(condition.Reason),
+			valueOrDash(condition.Message),
+		)
+	}
+	return view.String()
+}
+
+func (m Model) networkDetailsView() string {
+	details := m.networkDetails
+	var view strings.Builder
+	fmt.Fprintf(&view, "%s Details: %s\n\n", details.Kind, details.Name)
+	fmt.Fprintf(&view, "Type/Class: %s\n", valueOrDash(details.Type))
+	fmt.Fprintf(&view, "Address: %s\n", valueOrDash(details.Address))
+	fmt.Fprintf(&view, "Age: %s\n", formatAge(time.Now(), details.CreatedAt))
+	writeDetailSection(&view, "Ports", details.Ports)
+	writeDetailSection(&view, "Hosts", details.Hosts)
+	writeDetailSection(&view, "Selector", details.Selector)
+	writeDetailSection(&view, "Ready Endpoints", details.Endpoints)
+	writeDetailSection(&view, "Routes", details.Routes)
+	return view.String()
+}
+
 func (m Model) cronJobDetailsView() string {
 	details := m.cronJobDetails
 	var view strings.Builder
@@ -1262,6 +1492,8 @@ func (m Model) loadCurrent() tea.Cmd {
 		}
 	case workloadScreen:
 		return m.loadWorkloads()
+	case networkScreen:
+		return m.loadNetwork()
 	case eventScreen:
 		return m.loadEvents()
 	case doctorScreen:
@@ -1285,6 +1517,12 @@ func (m Model) loadCurrent() tea.Cmd {
 		return nil
 	case workloadRestartConfirmScreen:
 		return nil
+	case workloadDetailsScreen:
+		return m.loadWorkloadDetails()
+	case workloadPodsScreen:
+		return m.loadWorkloadPods()
+	case networkDetailsScreen:
+		return m.loadNetworkDetails()
 	case cronJobDetailsScreen:
 		return m.loadCronJobDetails()
 	case cronJobStateConfirmScreen:
@@ -1295,6 +1533,22 @@ func (m Model) loadCurrent() tea.Cmd {
 		return m.loadLogs(m.selectedContainer)
 	default:
 		return nil
+	}
+}
+
+func (m Model) loadWorkloadDetails() tea.Cmd {
+	namespace := selectedNamespace(m.dependencies.Profile)
+	return func() tea.Msg {
+		if m.dependencies.Workloads == nil {
+			return workloadDetailsMsg{err: errors.New("Kubernetes workload service is not configured")}
+		}
+		details, err := m.dependencies.Workloads.Describe(
+			context.Background(),
+			namespace,
+			m.selectedWorkload.Kind,
+			m.selectedWorkload.Name,
+		)
+		return workloadDetailsMsg{details: details, err: err}
 	}
 }
 
@@ -1309,6 +1563,22 @@ func (m Model) loadCronJobDetails() tea.Cmd {
 	}
 }
 
+func (m Model) loadWorkloadPods() tea.Cmd {
+	namespace := selectedNamespace(m.dependencies.Profile)
+	return func() tea.Msg {
+		if m.dependencies.Workloads == nil {
+			return workloadPodsMsg{err: errors.New("Kubernetes workload service is not configured")}
+		}
+		pods, err := m.dependencies.Workloads.Pods(
+			context.Background(),
+			namespace,
+			m.selectedWorkload.Kind,
+			m.selectedWorkload.Name,
+		)
+		return workloadPodsMsg{pods: pods, err: err}
+	}
+}
+
 func (m Model) loadWorkloads() tea.Cmd {
 	namespace := selectedNamespace(m.dependencies.Profile)
 	return func() tea.Msg {
@@ -1317,6 +1587,30 @@ func (m Model) loadWorkloads() tea.Cmd {
 		}
 		workloads, err := m.dependencies.Workloads.List(context.Background(), namespace)
 		return workloadsMsg{workloads: workloads, err: err}
+	}
+}
+
+func (m Model) loadNetwork() tea.Cmd {
+	namespace := selectedNamespace(m.dependencies.Profile)
+	return func() tea.Msg {
+		if m.dependencies.Network == nil {
+			return networkMsg{err: errors.New("Kubernetes network service is not configured")}
+		}
+		resources, err := m.dependencies.Network.List(context.Background(), namespace)
+		return networkMsg{resources: resources, err: err}
+	}
+}
+
+func (m Model) loadNetworkDetails() tea.Cmd {
+	namespace := selectedNamespace(m.dependencies.Profile)
+	return func() tea.Msg {
+		if m.dependencies.Network == nil {
+			return networkDetailsMsg{err: errors.New("Kubernetes network service is not configured")}
+		}
+		details, err := m.dependencies.Network.Describe(
+			context.Background(), namespace, m.selectedNetwork.Kind, m.selectedNetwork.Name,
+		)
+		return networkDetailsMsg{details: details, err: err}
 	}
 }
 
@@ -1420,8 +1714,12 @@ func (m Model) itemCount() int {
 		return len(m.namespaces)
 	case podScreen:
 		return len(m.pods)
+	case workloadPodsScreen:
+		return len(m.workloadPods)
 	case workloadScreen:
 		return len(m.workloads)
+	case networkScreen:
+		return len(m.networkResources)
 	case eventScreen:
 		return len(m.events)
 	case containerScreen:
@@ -1440,7 +1738,20 @@ func (m Model) isNestedScreen() bool {
 		m.screen == containerScreen || m.screen == portForwardScreen ||
 		m.screen == execContainerScreen || m.screen == execConfirmScreen ||
 		m.screen == podActionConfirmScreen || m.screen == workloadRestartConfirmScreen ||
-		m.screen == cronJobDetailsScreen || m.screen == cronJobStateConfirmScreen
+		m.screen == workloadDetailsScreen || m.screen == workloadPodsScreen || m.screen == networkDetailsScreen ||
+		m.screen == cronJobDetailsScreen ||
+		m.screen == cronJobStateConfirmScreen
+}
+
+func (m *Model) markLoaded(value screen) {
+	if m.err == nil {
+		m.loadedAt[value] = m.now()
+	}
+}
+
+func (m Model) cacheFresh(value screen) bool {
+	loaded, ok := m.loadedAt[value]
+	return ok && m.now().Sub(loaded) < m.cacheTTL
 }
 
 func cronJobStateAction(suspended bool) string {

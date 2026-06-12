@@ -173,6 +173,12 @@ In the TUI, press `d` to delete or uppercase `R` to restart the selected pod.
 The Workloads screen combines Deployments, StatefulSets, DaemonSets, and
 CronJobs. Replica workloads show ready, desired, updated, and available counts.
 CronJobs show their schedule, active runs, suspended state, and latest run.
+The help line changes with the selected resource so it shows only valid
+actions. Press Enter on a Deployment, StatefulSet, or DaemonSet to inspect its
+rollout health, strategy, selector, service account, pod-template images, and
+conditions. From that detail view, press `p` to list only the pods selected by
+the workload. Press Enter to inspect one of those pods or `l` to view its logs;
+returning from either keeps you in the workload's filtered pod list.
 Press Enter on a CronJob to inspect its settings and recent Jobs. Press `s`
 from the CronJob row or details to review and toggle between active and
 suspended scheduling.
@@ -183,6 +189,16 @@ workload, always requires confirmation, and requires typing the exact
 
 Suspend and resume always require confirmation. Production profiles require
 typing the exact `CronJob/name`.
+
+The Network screen combines Services and Ingresses for the selected namespace.
+It shows Service types, addresses, ports, Ingress classes, and hosts. Press
+Enter to inspect Service selectors and ready endpoints, or Ingress routes and
+their Service backends.
+
+Kubewisp reuses one Kubernetes API client for the process. Recently visited
+top-level TUI tabs remain cached for 15 seconds to make navigation immediate;
+press `r` at any time to force a fresh API read. Multi-kind Workloads and
+Network lists fetch their independent Kubernetes resources concurrently.
 
 Workload CLI commands:
 

@@ -89,6 +89,86 @@ func TestSupportsRolloutRestart(t *testing.T) {
 	}
 }
 
+func TestWorkloadsDescribeReplicaController(t *testing.T) {
+	t.Parallel()
+
+	replicas := int32(3)
+	client := fake.NewSimpleClientset(&appsv1.Deployment{
+		ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "apps"},
+		Spec: appsv1.DeploymentSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+			Strategy: appsv1.DeploymentStrategy{Type: appsv1.RollingUpdateDeploymentStrategyType},
+			Template: corev1.PodTemplateSpec{Spec: corev1.PodSpec{
+				ServiceAccountName: "api",
+				Containers:         []corev1.Container{{Name: "app", Image: "example/api:v1"}},
+			}},
+		},
+		Status: appsv1.DeploymentStatus{
+			ReadyReplicas: 2, UpdatedReplicas: 3, AvailableReplicas: 2,
+			Conditions: []appsv1.DeploymentCondition{{
+				Type: appsv1.DeploymentAvailable, Status: corev1.ConditionTrue,
+				Reason: "MinimumReplicasAvailable",
+			}},
+		},
+	})
+
+	details, err := NewWorkloadServiceWithFactory(fakeFactory{client: client}).Describe(
+		context.Background(),
+		"apps",
+		"Deployment",
+		"api",
+	)
+	if err != nil {
+		t.Fatalf("Describe() error = %v", err)
+	}
+	if details.Ready != 2 || details.Desired != 3 || details.Strategy != "RollingUpdate" ||
+		details.Selector != "app=api" || details.ServiceAccount != "api" {
+		t.Fatalf("details = %#v", details)
+	}
+	if !reflect.DeepEqual(details.Containers, []string{"app | image=example/api:v1"}) ||
+		len(details.Conditions) != 1 || details.Conditions[0].Reason != "MinimumReplicasAvailable" {
+		t.Fatalf("details = %#v", details)
+	}
+}
+
+func TestWorkloadsPodsUsesControllerSelector(t *testing.T) {
+	t.Parallel()
+
+	client := fake.NewSimpleClientset(
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "apps"},
+			Spec: appsv1.DeploymentSpec{
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "api-b", Namespace: "apps", Labels: map[string]string{"app": "api"}},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "api-a", Namespace: "apps", Labels: map[string]string{"app": "api"}},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{Name: "worker-a", Namespace: "apps", Labels: map[string]string{"app": "worker"}},
+		},
+	)
+
+	pods, err := NewWorkloadServiceWithFactory(fakeFactory{client: client}).Pods(
+		context.Background(),
+		"apps",
+		"Deployment",
+		"api",
+	)
+	if err != nil {
+		t.Fatalf("Pods() error = %v", err)
+	}
+	got := []string{pods[0].Name, pods[1].Name}
+	want := []string{"api-a", "api-b"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pods = %#v, want %#v", got, want)
+	}
+}
+
 func TestWorkloadsDescribeCronJobIncludesOwnedJobs(t *testing.T) {
 	t.Parallel()
 

@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"strings"
+	"sync"
 
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/version"
@@ -24,24 +25,34 @@ type ClientFactory interface {
 	Client() (kubernetes.Interface, error)
 }
 
-type KubeconfigClientFactory struct{}
+type KubeconfigClientFactory struct {
+	once   sync.Once
+	client kubernetes.Interface
+	err    error
+}
 
-func (KubeconfigClientFactory) Client() (kubernetes.Interface, error) {
-	rules := clientcmd.NewDefaultClientConfigLoadingRules()
-	clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
-		rules,
-		&clientcmd.ConfigOverrides{},
-	)
-	restConfig, err := clientConfig.ClientConfig()
-	if err != nil {
-		return nil, fmt.Errorf("load kubeconfig: %w", err)
-	}
+func NewKubeconfigClientFactory() *KubeconfigClientFactory {
+	return &KubeconfigClientFactory{}
+}
 
-	client, err := kubernetes.NewForConfig(restConfig)
-	if err != nil {
-		return nil, fmt.Errorf("create Kubernetes client: %w", err)
-	}
-	return client, nil
+func (f *KubeconfigClientFactory) Client() (kubernetes.Interface, error) {
+	f.once.Do(func() {
+		rules := clientcmd.NewDefaultClientConfigLoadingRules()
+		clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
+			rules,
+			&clientcmd.ConfigOverrides{},
+		)
+		restConfig, err := clientConfig.ClientConfig()
+		if err != nil {
+			f.err = fmt.Errorf("load kubeconfig: %w", err)
+			return
+		}
+		f.client, f.err = kubernetes.NewForConfig(restConfig)
+		if f.err != nil {
+			f.err = fmt.Errorf("create Kubernetes client: %w", f.err)
+		}
+	})
+	return f.client, f.err
 }
 
 type Checker struct {
@@ -49,7 +60,7 @@ type Checker struct {
 }
 
 func NewConnectivityChecker() *Checker {
-	return &Checker{factory: KubeconfigClientFactory{}}
+	return &Checker{factory: NewKubeconfigClientFactory()}
 }
 
 func NewConnectivityCheckerWithFactory(factory ClientFactory) *Checker {

@@ -111,7 +111,7 @@ type Pods struct {
 }
 
 func NewPodService() *Pods {
-	return &Pods{factory: KubeconfigClientFactory{}, logStream: streamPodLogs}
+	return &Pods{factory: NewKubeconfigClientFactory(), logStream: streamPodLogs}
 }
 
 func NewPodServiceWithFactory(factory ClientFactory) *Pods {

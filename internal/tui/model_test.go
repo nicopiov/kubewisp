@@ -34,14 +34,29 @@ type fakeDoctor struct {
 }
 
 type fakeWorkloads struct {
-	items     []kube.WorkloadSummary
-	restarted *string
-	details   kube.CronJobDetails
-	suspended *bool
+	items           []kube.WorkloadSummary
+	restarted       *string
+	details         kube.CronJobDetails
+	workloadDetails kube.WorkloadDetails
+	managedPods     []kube.PodSummary
+	suspended       *bool
 }
 
 type fakeEvents struct {
 	items []kube.NamespaceEventSummary
+}
+
+type fakeNetwork struct {
+	items   []kube.NetworkSummary
+	details kube.NetworkDetails
+}
+
+func (f fakeNetwork) List(context.Context, string) ([]kube.NetworkSummary, error) {
+	return f.items, nil
+}
+
+func (f fakeNetwork) Describe(context.Context, string, string, string) (kube.NetworkDetails, error) {
+	return f.details, nil
 }
 
 func (f fakeEvents) ListWarnings(context.Context, string) ([]kube.NamespaceEventSummary, error) {
@@ -61,6 +76,14 @@ func (f fakeWorkloads) RolloutRestart(_ context.Context, _, kind, name string) e
 
 func (f fakeWorkloads) DescribeCronJob(context.Context, string, string) (kube.CronJobDetails, error) {
 	return f.details, nil
+}
+
+func (f fakeWorkloads) Describe(context.Context, string, string, string) (kube.WorkloadDetails, error) {
+	return f.workloadDetails, nil
+}
+
+func (f fakeWorkloads) Pods(context.Context, string, string, string) ([]kube.PodSummary, error) {
+	return f.managedPods, nil
 }
 
 func (f fakeWorkloads) SetCronJobSuspended(_ context.Context, _, _ string, suspended bool) error {
@@ -193,6 +216,32 @@ func testDependencies(t *testing.T) Dependencies {
 			Jobs: []kube.JobSummary{{
 				Name: "cleanup-123", Status: "Completed", Succeeded: 1,
 			}},
+		}, workloadDetails: kube.WorkloadDetails{
+			WorkloadSummary: kube.WorkloadSummary{
+				Kind: "Deployment", Name: "api", Ready: 2, Desired: 3, Updated: 3, Available: 2,
+			},
+			Strategy:       "RollingUpdate",
+			Selector:       "app=api",
+			ServiceAccount: "api",
+			Containers:     []string{"app | image=example/api:v1"},
+			Conditions: []kube.WorkloadCondition{{
+				Type: "Available", Status: "True", Reason: "MinimumReplicasAvailable",
+			}},
+		}, managedPods: []kube.PodSummary{{
+			Name: "api-abc", Ready: "1/1", Status: "Running",
+		}}},
+		Network: fakeNetwork{items: []kube.NetworkSummary{{
+			Kind: "Service", Name: "api", Type: "ClusterIP", Address: "10.0.0.1",
+			Ports: []string{"http:80/TCP -> 8080"},
+		}, {
+			Kind: "Ingress", Name: "api", Type: "gce", Hosts: []string{"api.example.com"},
+		}}, details: kube.NetworkDetails{
+			NetworkSummary: kube.NetworkSummary{
+				Kind: "Service", Name: "api", Type: "ClusterIP", Address: "10.0.0.1",
+				Ports: []string{"http:80/TCP -> 8080"},
+			},
+			Selector:  []string{"app=api"},
+			Endpoints: []string{"10.2.0.5"},
 		}},
 		Events: fakeEvents{items: []kube.NamespaceEventSummary{{
 			ObjectKind: "Pod",
@@ -631,7 +680,7 @@ func TestNavigateToDoctorShowsHealthyReport(t *testing.T) {
 	t.Parallel()
 
 	model := NewModel(testDependencies(t))
-	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'6'}})
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'7'}})
 	message := command()
 	updated, _ = updated.(Model).Update(message)
 	final := updated.(Model)
@@ -653,11 +702,57 @@ func TestNavigateToDoctorShowsHealthyReport(t *testing.T) {
 	}
 }
 
-func TestEventsScreenShowsWarningsAndDrillsIntoPod(t *testing.T) {
+func TestNetworkScreenShowsResourcesAndOpensDetails(t *testing.T) {
 	t.Parallel()
 
 	model := NewModel(testDependencies(t))
 	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	updated, _ = updated.(Model).Update(command())
+	network := updated.(Model)
+	for _, expected := range []string{"[Network]", "Service", "10.0.0.1", "Ingress", "api.example.com"} {
+		if !strings.Contains(network.View(), expected) {
+			t.Fatalf("network view does not contain %q:\n%s", expected, network.View())
+		}
+	}
+	network.cursor = 1
+	updated, command = network.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = updated.(Model).Update(command())
+	details := updated.(Model)
+	for _, expected := range []string{"Service Details: api", "app=api", "10.2.0.5", "http:80/TCP"} {
+		if !strings.Contains(details.View(), expected) {
+			t.Fatalf("network details do not contain %q:\n%s", expected, details.View())
+		}
+	}
+	updated, _ = details.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if updated.(Model).screen != networkScreen {
+		t.Fatalf("details escape screen = %d, want networkScreen", updated.(Model).screen)
+	}
+}
+
+func TestFreshTabCacheAvoidsReloadUntilRefresh(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = podScreen
+	model.loading = false
+	model.loadedAt[networkScreen] = model.now()
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'5'}})
+	cached := updated.(Model)
+	if command != nil || cached.loading {
+		t.Fatal("fresh Network tab triggered a reload")
+	}
+	updated, command = cached.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	if command == nil || !updated.(Model).loading {
+		t.Fatal("explicit refresh did not reload cached Network tab")
+	}
+}
+
+func TestEventsScreenShowsWarningsAndDrillsIntoPod(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'6'}})
 	updated, _ = updated.(Model).Update(command())
 	events := updated.(Model)
 
@@ -711,6 +806,109 @@ func TestWorkloadsScreenShowsReplicaHealth(t *testing.T) {
 		if !strings.Contains(final.View(), expected) {
 			t.Fatalf("view does not contain %q:\n%s", expected, final.View())
 		}
+	}
+}
+
+func TestWorkloadHelpChangesWithSelectedResource(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = workloadScreen
+	model.loading = false
+	model.workloads = []kube.WorkloadSummary{
+		{Kind: "Deployment", Name: "api"},
+		{Kind: "CronJob", Name: "cleanup"},
+	}
+
+	if view := model.View(); !strings.Contains(view, "R rollout restart") || strings.Contains(view, "s suspend/resume") {
+		t.Fatalf("deployment help is not dynamic:\n%s", view)
+	}
+	model.cursor = 1
+	if view := model.View(); !strings.Contains(view, "s suspend/resume") || strings.Contains(view, "R rollout restart") {
+		t.Fatalf("CronJob help is not dynamic:\n%s", view)
+	}
+}
+
+func TestReplicaWorkloadEnterLoadsDetails(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = workloadScreen
+	model.loading = false
+	model.workloads = []kube.WorkloadSummary{{Kind: "Deployment", Name: "api"}}
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	if command == nil {
+		t.Fatal("Enter did not load workload details")
+	}
+	updated, _ = updated.(Model).Update(command())
+	final := updated.(Model)
+
+	if final.screen != workloadDetailsScreen {
+		t.Fatalf("screen = %d, want workloadDetailsScreen", final.screen)
+	}
+	for _, want := range []string{
+		"Deployment Details: api", "RollingUpdate", "app=api",
+		"app | image=example/api:v1", "MinimumReplicasAvailable",
+		"p managed pods", "R rollout restart",
+	} {
+		if !strings.Contains(final.View(), want) {
+			t.Fatalf("details missing %q:\n%s", want, final.View())
+		}
+	}
+}
+
+func TestWorkloadDetailsOpenManagedPodsAndPodDetails(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = workloadDetailsScreen
+	model.loading = false
+	model.selectedWorkload = kube.WorkloadSummary{Kind: "Deployment", Name: "api"}
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'p'}})
+	if command == nil {
+		t.Fatal("p did not load managed pods")
+	}
+	updated, _ = updated.(Model).Update(command())
+	pods := updated.(Model)
+	if pods.screen != workloadPodsScreen ||
+		!strings.Contains(pods.View(), "Pods managed by Deployment/api") ||
+		!strings.Contains(pods.View(), "api-abc") {
+		t.Fatalf("unexpected managed pods view:\n%s", pods.View())
+	}
+
+	updated, command = pods.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = updated.(Model).Update(command())
+	details := updated.(Model)
+	if details.screen != podDetailsScreen || details.selectedPod != "api-abc" {
+		t.Fatalf("unexpected pod details model: %#v", details)
+	}
+	updated, _ = details.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if updated.(Model).screen != workloadPodsScreen {
+		t.Fatalf("details escape screen = %d, want workloadPodsScreen", updated.(Model).screen)
+	}
+}
+
+func TestWorkloadManagedPodLogsReturnToManagedPods(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = workloadPodsScreen
+	model.loading = false
+	model.selectedWorkload = kube.WorkloadSummary{Kind: "Deployment", Name: "api"}
+	model.workloadPods = []kube.PodSummary{{Name: "api-abc"}}
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'l'}})
+	updated, command = updated.(Model).Update(command())
+	updated, _ = updated.(Model).Update(command())
+	logs := updated.(Model)
+	if logs.screen != podLogsScreen || !strings.Contains(logs.View(), "hello from app") {
+		t.Fatalf("unexpected logs view:\n%s", logs.View())
+	}
+	updated, _ = logs.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if updated.(Model).screen != workloadPodsScreen {
+		t.Fatalf("logs escape screen = %d, want workloadPodsScreen", updated.(Model).screen)
 	}
 }
 

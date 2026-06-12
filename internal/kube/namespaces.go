@@ -19,7 +19,7 @@ type Namespaces struct {
 }
 
 func NewNamespaceService() *Namespaces {
-	return &Namespaces{factory: KubeconfigClientFactory{}}
+	return &Namespaces{factory: NewKubeconfigClientFactory()}
 }
 
 func NewNamespaceServiceWithFactory(factory ClientFactory) *Namespaces {

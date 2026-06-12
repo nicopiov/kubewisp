@@ -15,11 +15,13 @@ import (
 )
 
 func main() {
-	connectivity := kube.NewConnectivityChecker()
-	namespaces := kube.NewNamespaceService()
-	pods := kube.NewPodService()
-	workloads := kube.NewWorkloadService()
-	events := kube.NewEventService()
+	clientFactory := kube.NewKubeconfigClientFactory()
+	connectivity := kube.NewConnectivityCheckerWithFactory(clientFactory)
+	namespaces := kube.NewNamespaceServiceWithFactory(clientFactory)
+	pods := kube.NewPodServiceWithFactory(clientFactory)
+	workloads := kube.NewWorkloadServiceWithFactory(clientFactory)
+	events := kube.NewEventServiceWithFactory(clientFactory)
+	network := kube.NewNetworkServiceWithFactory(clientFactory)
 	commandRunner := runner.NewOSRunner()
 	doctorReporter := doctor.NewService(commandRunner)
 	kubectlService := kubectl.NewService(commandRunner)
@@ -33,7 +35,7 @@ func main() {
 		PortForward:  kubectlService,
 		Exec:         kubectlService,
 		Selector:     selector.NewTerminal(),
-		TUI:          tui.NewRunner(connectivity, namespaces, pods, workloads, events, doctorReporter, kubectlService, kubectlService),
+		TUI:          tui.NewRunner(connectivity, namespaces, pods, workloads, network, events, doctorReporter, kubectlService, kubectlService),
 		Version:      buildVersion(),
 	})
 
