@@ -15,6 +15,26 @@ import (
 
 var zonePattern = regexp.MustCompile(`-[a-z]$`)
 
+func IsReauthenticationError(err error) bool {
+	if err == nil {
+		return false
+	}
+	message := strings.ToLower(err.Error())
+	for _, hint := range []string{
+		"reauthentication failed",
+		"problem refreshing your current auth token",
+		"problem refreshing your current auth tokens",
+		"invalid_grant",
+		"credentials have been revoked",
+		"gcloud auth login",
+	} {
+		if strings.Contains(message, hint) {
+			return true
+		}
+	}
+	return false
+}
+
 type Cluster struct {
 	Name         string `json:"name"`
 	Location     string `json:"location"`

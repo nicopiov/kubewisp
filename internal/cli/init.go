@@ -36,7 +36,14 @@ func newInitCommand(dependencies Dependencies, configPath *string) *cobra.Comman
 
 			account, err := client.ActiveAccount(command.Context())
 			if err != nil {
-				return err
+				if !gcloud.IsReauthenticationError(err) {
+					return err
+				}
+				fmt.Fprintln(output, "Your Google Cloud authentication has expired or was revoked.")
+				account, err = reauthenticateGcloud(command, reader, output, client)
+				if err != nil {
+					return err
+				}
 			}
 			if account == "" {
 				login, err := promptYesNo(reader, output, "No active Google account. Run gcloud auth login?", true)
@@ -65,6 +72,14 @@ func newInitCommand(dependencies Dependencies, configPath *string) *cobra.Comman
 			fmt.Fprintf(output, "Active Google account: %s\n", account)
 
 			projects, err := client.ListProjects(command.Context())
+			if err != nil && gcloud.IsReauthenticationError(err) {
+				fmt.Fprintln(output, "Your Google Cloud authentication has expired or was revoked.")
+				account, err = reauthenticateGcloud(command, reader, output, client)
+				if err == nil {
+					fmt.Fprintf(output, "Active Google account: %s\n", account)
+					projects, err = client.ListProjects(command.Context())
+				}
+			}
 			if err != nil {
 				return err
 			}
@@ -155,6 +170,32 @@ func newInitCommand(dependencies Dependencies, configPath *string) *cobra.Comman
 			return nil
 		},
 	}
+}
+
+func reauthenticateGcloud(
+	command *cobra.Command,
+	reader *bufio.Reader,
+	output io.Writer,
+	client *gcloud.Client,
+) (string, error) {
+	login, err := promptYesNo(reader, output, "Run gcloud auth login now?", true)
+	if err != nil {
+		return "", err
+	}
+	if !login {
+		return "", errors.New("Google Cloud reauthentication is required; run `gcloud auth login` and retry")
+	}
+	if err := client.Login(command.Context(), reader, output, command.ErrOrStderr()); err != nil {
+		return "", err
+	}
+	account, err := client.ActiveAccount(command.Context())
+	if err != nil {
+		return "", err
+	}
+	if account == "" {
+		return "", errors.New("gcloud login completed without an active Google account")
+	}
+	return account, nil
 }
 
 func chooseProject(reader *bufio.Reader, output io.Writer, projects []string) (string, error) {

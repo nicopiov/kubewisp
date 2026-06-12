@@ -23,6 +23,7 @@ type Dependencies struct {
 	PortForward  kubectl.PortForwarder
 	Selector     selector.Service
 	TUI          tui.Service
+	Version      string
 }
 
 func NewRootCommand(dependencies Dependencies) *cobra.Command {
@@ -60,6 +61,7 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 	command.AddCommand(newPodsCommand(dependencies, &configPath))
 	command.AddCommand(newProfileCommand(&configPath))
 	command.AddCommand(newTUICommand(dependencies, &configPath))
+	command.AddCommand(newVersionCommand(dependencies.Version))
 
 	return command
 }

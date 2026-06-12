@@ -3,6 +3,7 @@ package main
 import (
 	"fmt"
 	"os"
+	"runtime/debug"
 
 	"github.com/nicopiov/kubewisp/internal/cli"
 	"github.com/nicopiov/kubewisp/internal/doctor"
@@ -28,10 +29,19 @@ func main() {
 		PortForward:  kubectlService,
 		Selector:     selector.NewTerminal(),
 		TUI:          tui.NewRunner(connectivity, namespaces, pods, doctorReporter, kubectlService),
+		Version:      buildVersion(),
 	})
 
 	if err := command.Execute(); err != nil {
 		fmt.Fprintln(os.Stderr, err)
 		os.Exit(1)
 	}
+}
+
+func buildVersion() string {
+	info, ok := debug.ReadBuildInfo()
+	if !ok || info.Main.Version == "" {
+		return "dev"
+	}
+	return info.Main.Version
 }

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"os"
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/nicopiov/kubewisp/internal/config"
@@ -45,6 +46,9 @@ func (r *Runner) Run(ctx context.Context, input io.Reader, output io.Writer, con
 	store := config.Store{Path: configPath}
 	cfg, err := store.Load()
 	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return fmt.Errorf("no Kubewisp config found at %q; run `kubewisp init`", configPath)
+		}
 		return fmt.Errorf("load dashboard config: %w", err)
 	}
 	if cfg.CurrentProfile == "" {

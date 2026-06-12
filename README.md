@@ -14,6 +14,14 @@ make build
 ./bin/kubewisp cluster status
 ```
 
+Install a published version with Go:
+
+```bash
+go install github.com/nicopiov/kubewisp/cmd/kubewisp@latest
+kubewisp version
+kubewisp init
+```
+
 After initialization, running Kubewisp without a subcommand opens the TUI
 dashboard:
 

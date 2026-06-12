@@ -91,3 +91,20 @@ func TestGetCredentialsUsesLocationFlag(t *testing.T) {
 		t.Fatalf("zonal location flag = %q, want --zone", got)
 	}
 }
+
+func TestIsReauthenticationError(t *testing.T) {
+	t.Parallel()
+
+	for _, message := range []string{
+		"There was a problem refreshing your current auth tokens: reauthentication failed",
+		"invalid_grant: Token has been expired or revoked",
+		"Please run: gcloud auth login",
+	} {
+		if !IsReauthenticationError(errors.New(message)) {
+			t.Errorf("IsReauthenticationError(%q) = false", message)
+		}
+	}
+	if IsReauthenticationError(errors.New("permission denied")) {
+		t.Fatal("IsReauthenticationError(permission denied) = true")
+	}
+}

@@ -142,3 +142,43 @@ func TestInitLogsInWhenNoAccountIsActive(t *testing.T) {
 		t.Fatalf("interactive args = %#v, want auth login", got)
 	}
 }
+
+func TestInitReauthenticatesWhenProjectDiscoveryTokenExpired(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	commandRunner := &initRunner{
+		results: []runner.CommandResult{
+			{Stdout: "developer@company.com\n"},
+			{Err: errors.New("exit 1"), Stderr: "There was a problem refreshing your current auth tokens: reauthentication failed"},
+			{Stdout: "developer@company.com\n"},
+			{Stdout: "company-staging\n"},
+			{Stdout: `[{"name":"staging-main","location":"europe-west1"}]`},
+			{},
+			{},
+		},
+	}
+	command := NewRootCommand(Dependencies{
+		Runner: commandRunner,
+		Connectivity: initConnectivity{
+			report: kube.ConnectivityReport{ServerVersion: "v1.32.1", Namespace: "default"},
+		},
+	})
+	var output bytes.Buffer
+	command.SetIn(strings.NewReader("\n\n\n\n"))
+	command.SetOut(&output)
+	command.SetErr(&output)
+	command.SetArgs([]string{"--config", path, "init"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v\n%s", err, output.String())
+	}
+	if got := len(commandRunner.interactiveCalls); got != 1 {
+		t.Fatalf("interactive calls = %d, want 1", got)
+	}
+	for _, expected := range []string{"authentication has expired or was revoked", "Run gcloud auth login now?"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("output does not contain %q:\n%s", expected, output.String())
+		}
+	}
+}
