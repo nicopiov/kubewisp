@@ -1,6 +1,7 @@
 package cli
 
 import (
+	"bufio"
 	"errors"
 	"fmt"
 	"io"
@@ -25,8 +26,200 @@ func newPodsCommand(dependencies Dependencies, configPath *string) *cobra.Comman
 		newPodsDescribeCommand(dependencies, configPath),
 		newPodsLogsCommand(dependencies, configPath),
 		newPodsPortForwardCommand(dependencies, configPath),
+		newPodsExecCommand(dependencies, configPath),
+		newPodsDeleteCommand(dependencies, configPath),
+		newPodsRestartCommand(dependencies, configPath),
 	)
 	return command
+}
+
+func newPodsDeleteCommand(dependencies Dependencies, configPath *string) *cobra.Command {
+	return newPodsDestructiveCommand(dependencies, configPath, false)
+}
+
+func newPodsRestartCommand(dependencies Dependencies, configPath *string) *cobra.Command {
+	return newPodsDestructiveCommand(dependencies, configPath, true)
+}
+
+func newPodsDestructiveCommand(dependencies Dependencies, configPath *string, restart bool) *cobra.Command {
+	action := "delete"
+	short := "Delete a pod after confirmation"
+	if restart {
+		action = "restart"
+		short = "Restart a controller-managed pod by deleting it"
+	}
+	return &cobra.Command{
+		Use:   action + " [pod]",
+		Short: short,
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			_, profileName, profile, err := currentProfile(*configPath)
+			if err != nil {
+				return err
+			}
+			if dependencies.Pods == nil {
+				return errors.New("Kubernetes pod service is not configured")
+			}
+			namespace := selectedNamespace(profile)
+			pod, err := optionalPod(command, dependencies, namespace, args)
+			if errors.Is(err, selector.ErrCancelled) {
+				fmt.Fprintln(command.OutOrStdout(), "Pod selection cancelled.")
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("select pod for profile %q: %w", profileName, err)
+			}
+			info, err := dependencies.Pods.ActionInfo(command.Context(), namespace, pod)
+			if err != nil {
+				return err
+			}
+			if restart && info.ControllerOwner == "" {
+				return errors.New("restart is blocked because this pod has no controller owner")
+			}
+
+			writePodActionContext(command.OutOrStdout(), action, profileName, profile, namespace, pod, info)
+			confirmed, err := confirmPodAction(command, profile.Production, action, pod)
+			if err != nil {
+				return err
+			}
+			if !confirmed {
+				fmt.Fprintf(command.OutOrStdout(), "%s cancelled.\n", strings.ToUpper(action[:1])+action[1:])
+				return nil
+			}
+			if err := dependencies.Pods.Delete(command.Context(), namespace, pod); err != nil {
+				return err
+			}
+			if restart {
+				fmt.Fprintf(command.OutOrStdout(), "Pod %q deleted; controller %s will recreate it.\n", pod, info.ControllerOwner)
+			} else {
+				fmt.Fprintf(command.OutOrStdout(), "Pod %q deleted.\n", pod)
+			}
+			return nil
+		},
+	}
+}
+
+func confirmPodAction(command *cobra.Command, production bool, action, pod string) (bool, error) {
+	reader := bufio.NewReader(command.InOrStdin())
+	if production {
+		value, err := promptText(reader, command.OutOrStdout(), fmt.Sprintf("PRODUCTION: type pod name %q to %s", pod, action), "")
+		if err != nil {
+			return false, err
+		}
+		return value == pod, nil
+	}
+	return promptYesNo(reader, command.OutOrStdout(), fmt.Sprintf("%s pod %q?", strings.Title(action), pod), false)
+}
+
+func writePodActionContext(
+	output io.Writer,
+	action, profileName string,
+	profile config.Profile,
+	namespace, pod string,
+	info kube.PodActionInfo,
+) {
+	fmt.Fprintf(output, "%s target:\n", strings.Title(action))
+	fmt.Fprintf(output, "  Profile: %s\n", profileName)
+	fmt.Fprintf(output, "  Project: %s\n", profile.ProjectID)
+	fmt.Fprintf(output, "  Cluster: %s\n", profile.ClusterName)
+	fmt.Fprintf(output, "  Namespace: %s\n", namespace)
+	fmt.Fprintf(output, "  Pod: %s\n", pod)
+	fmt.Fprintf(output, "  Controller: %s\n", valueOrDash(info.ControllerOwner))
+}
+
+func newPodsExecCommand(dependencies Dependencies, configPath *string) *cobra.Command {
+	var container string
+	var shell string
+
+	command := &cobra.Command{
+		Use:   "exec [pod]",
+		Short: "Open an interactive shell in a pod container",
+		Args:  cobra.MaximumNArgs(1),
+		RunE: func(command *cobra.Command, args []string) error {
+			_, profileName, profile, err := currentProfile(*configPath)
+			if err != nil {
+				return err
+			}
+			if dependencies.Pods == nil {
+				return errors.New("Kubernetes pod service is not configured")
+			}
+			if dependencies.Exec == nil {
+				return errors.New("kubectl exec service is not configured")
+			}
+			if strings.TrimSpace(shell) == "" {
+				return errors.New("--shell cannot be empty")
+			}
+
+			namespace := selectedNamespace(profile)
+			pod, err := optionalPod(command, dependencies, namespace, args)
+			if errors.Is(err, selector.ErrCancelled) {
+				fmt.Fprintln(command.OutOrStdout(), "Pod selection cancelled.")
+				return nil
+			}
+			if err != nil {
+				return fmt.Errorf("select pod for profile %q: %w", profileName, err)
+			}
+			if container == "" {
+				container, err = choosePodContainer(command, dependencies, namespace, pod)
+				if errors.Is(err, selector.ErrCancelled) {
+					fmt.Fprintln(command.OutOrStdout(), "Container selection cancelled.")
+					return nil
+				}
+				if err != nil {
+					return fmt.Errorf("select container for profile %q: %w", profileName, err)
+				}
+			}
+
+			writeExecContext(command.OutOrStdout(), profileName, profile, namespace, pod, container, shell)
+			if profile.Production {
+				confirmed, err := promptYesNo(
+					bufio.NewReader(command.InOrStdin()),
+					command.OutOrStdout(),
+					"Production profile. Open this shell?",
+					false,
+				)
+				if err != nil {
+					return err
+				}
+				if !confirmed {
+					fmt.Fprintln(command.OutOrStdout(), "Exec cancelled.")
+					return nil
+				}
+			}
+
+			return dependencies.Exec.Exec(
+				command.Context(),
+				command.InOrStdin(),
+				command.OutOrStdout(),
+				command.ErrOrStderr(),
+				kubectl.ExecOptions{
+					Namespace: namespace,
+					Pod:       pod,
+					Container: container,
+					Command:   shell,
+				},
+			)
+		},
+	}
+	command.Flags().StringVarP(&container, "container", "c", "", "container name")
+	command.Flags().StringVar(&shell, "shell", "/bin/sh", "shell executable")
+	return command
+}
+
+func writeExecContext(
+	output io.Writer,
+	profileName string,
+	profile config.Profile,
+	namespace, pod, container, shell string,
+) {
+	fmt.Fprintln(output, "Exec target:")
+	fmt.Fprintf(output, "  Profile: %s\n", profileName)
+	fmt.Fprintf(output, "  Project: %s\n", profile.ProjectID)
+	fmt.Fprintf(output, "  Cluster: %s\n", profile.ClusterName)
+	fmt.Fprintf(output, "  Namespace: %s\n", namespace)
+	fmt.Fprintf(output, "  Pod: %s\n", pod)
+	fmt.Fprintf(output, "  Container: %s\n", container)
+	fmt.Fprintf(output, "  Shell: %s\n", shell)
 }
 
 func newPodsPortForwardCommand(dependencies Dependencies, configPath *string) *cobra.Command {

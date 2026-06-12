@@ -18,6 +18,8 @@ func main() {
 	connectivity := kube.NewConnectivityChecker()
 	namespaces := kube.NewNamespaceService()
 	pods := kube.NewPodService()
+	workloads := kube.NewWorkloadService()
+	events := kube.NewEventService()
 	commandRunner := runner.NewOSRunner()
 	doctorReporter := doctor.NewService(commandRunner)
 	kubectlService := kubectl.NewService(commandRunner)
@@ -26,9 +28,12 @@ func main() {
 		Connectivity: connectivity,
 		Namespaces:   namespaces,
 		Pods:         pods,
+		Workloads:    workloads,
+		Events:       events,
 		PortForward:  kubectlService,
+		Exec:         kubectlService,
 		Selector:     selector.NewTerminal(),
-		TUI:          tui.NewRunner(connectivity, namespaces, pods, doctorReporter, kubectlService),
+		TUI:          tui.NewRunner(connectivity, namespaces, pods, workloads, events, doctorReporter, kubectlService, kubectlService),
 		Version:      buildVersion(),
 	})
 

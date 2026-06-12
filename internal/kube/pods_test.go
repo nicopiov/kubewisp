@@ -138,6 +138,74 @@ func TestPodsPortsReturnsStructuredSortedPorts(t *testing.T) {
 	}
 }
 
+func TestPodsActionInfoAndDelete(t *testing.T) {
+	t.Parallel()
+
+	controller := true
+	client := fake.NewSimpleClientset(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      "api",
+			Namespace: "api",
+			OwnerReferences: []metav1.OwnerReference{{
+				Kind:       "ReplicaSet",
+				Name:       "api-abc",
+				Controller: &controller,
+			}},
+		},
+	})
+	service := NewPodServiceWithFactory(fakeFactory{client: client})
+
+	info, err := service.ActionInfo(context.Background(), "api", "api")
+	if err != nil {
+		t.Fatalf("ActionInfo() error = %v", err)
+	}
+	if info.ControllerOwner != "ReplicaSet/api-abc" {
+		t.Fatalf("ControllerOwner = %q", info.ControllerOwner)
+	}
+	if err := service.Delete(context.Background(), "api", "api"); err != nil {
+		t.Fatalf("Delete() error = %v", err)
+	}
+	if _, err := client.CoreV1().Pods("api").Get(context.Background(), "api", metav1.GetOptions{}); err == nil {
+		t.Fatal("pod still exists after Delete()")
+	}
+}
+
+func TestSummarizePodTracksLastRestart(t *testing.T) {
+	t.Parallel()
+
+	finished := metav1.NewTime(time.Now().Add(-time.Minute))
+	summary := summarizePod(&corev1.Pod{
+		Spec: corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
+		Status: corev1.PodStatus{ContainerStatuses: []corev1.ContainerStatus{{
+			Name:         "app",
+			RestartCount: 3,
+			LastTerminationState: corev1.ContainerState{Terminated: &corev1.ContainerStateTerminated{
+				FinishedAt: finished,
+			}},
+		}}},
+	})
+	if !summary.LastRestartAt.Equal(finished.Time) {
+		t.Fatalf("LastRestartAt = %v, want %v", summary.LastRestartAt, finished.Time)
+	}
+}
+
+func TestSummarizePodTracksControllerOwner(t *testing.T) {
+	t.Parallel()
+
+	controller := true
+	summary := summarizePod(&corev1.Pod{
+		ObjectMeta: metav1.ObjectMeta{OwnerReferences: []metav1.OwnerReference{{
+			Kind:       "Job",
+			Name:       "cleanup-123",
+			Controller: &controller,
+		}}},
+	})
+
+	if summary.OwnerKind != "Job" || summary.OwnerName != "cleanup-123" {
+		t.Fatalf("owner = %s/%s, want Job/cleanup-123", summary.OwnerKind, summary.OwnerName)
+	}
+}
+
 func TestPodsLogsPassesOptionsToStream(t *testing.T) {
 	t.Parallel()
 

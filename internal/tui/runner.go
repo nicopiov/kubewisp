@@ -22,23 +22,32 @@ type Runner struct {
 	connectivity kube.ConnectivityChecker
 	namespaces   kube.NamespaceService
 	pods         kube.PodService
+	workloads    kube.WorkloadService
+	events       kube.EventService
 	doctor       doctor.Reporter
 	portForward  kubectl.PortForwarder
+	exec         kubectl.Executor
 }
 
 func NewRunner(
 	connectivity kube.ConnectivityChecker,
 	namespaces kube.NamespaceService,
 	pods kube.PodService,
+	workloads kube.WorkloadService,
+	events kube.EventService,
 	doctorReporter doctor.Reporter,
 	portForwarder kubectl.PortForwarder,
+	executor kubectl.Executor,
 ) *Runner {
 	return &Runner{
 		connectivity: connectivity,
 		namespaces:   namespaces,
 		pods:         pods,
+		workloads:    workloads,
+		events:       events,
 		doctor:       doctorReporter,
 		portForward:  portForwarder,
+		exec:         executor,
 	}
 }
 
@@ -66,10 +75,14 @@ func (r *Runner) Run(ctx context.Context, input io.Reader, output io.Writer, con
 		Connectivity: r.connectivity,
 		Namespaces:   r.namespaces,
 		Pods:         r.pods,
+		Workloads:    r.workloads,
+		Events:       r.events,
 		Doctor:       r.doctor,
+		PortForward:  r.portForward,
+		Exec:         r.exec,
 	})
 
-	result, err := tea.NewProgram(
+	_, err = tea.NewProgram(
 		model,
 		tea.WithContext(ctx),
 		tea.WithInput(input),
@@ -78,25 +91,6 @@ func (r *Runner) Run(ctx context.Context, input io.Reader, output io.Writer, con
 	).Run()
 	if err != nil {
 		return fmt.Errorf("run dashboard: %w", err)
-	}
-	finalModel, ok := result.(Model)
-	if !ok || finalModel.portForward == nil {
-		return nil
-	}
-	if r.portForward == nil {
-		return errors.New("kubectl port-forward service is not configured")
-	}
-	options := *finalModel.portForward
-	fmt.Fprintf(
-		output,
-		"Forwarding localhost:%d to %s/%s:%d. Press Ctrl+C to stop.\n",
-		options.LocalPort,
-		options.Namespace,
-		options.Pod,
-		options.RemotePort,
-	)
-	if err := r.portForward.PortForward(ctx, input, output, output, options); err != nil {
-		return err
 	}
 	return nil
 }

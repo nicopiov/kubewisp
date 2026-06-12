@@ -9,6 +9,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/nicopiov/kubewisp/internal/config"
 	"github.com/nicopiov/kubewisp/internal/kube"
 	"github.com/nicopiov/kubewisp/internal/kubectl"
 	"github.com/nicopiov/kubewisp/internal/selector"
@@ -25,6 +26,8 @@ type fakePods struct {
 	ports       []kube.PodPort
 	logs        string
 	logOptions  kube.PodLogsOptions
+	actionInfo  kube.PodActionInfo
+	deleted     bool
 }
 
 func (f *fakePods) List(_ context.Context, namespace string) ([]kube.PodSummary, error) {
@@ -55,8 +58,35 @@ func (f *fakePods) Ports(_ context.Context, namespace, name string) ([]kube.PodP
 	return f.ports, nil
 }
 
+func (f *fakePods) ActionInfo(_ context.Context, namespace, name string) (kube.PodActionInfo, error) {
+	f.namespace = namespace
+	f.name = name
+	return f.actionInfo, nil
+}
+
+func (f *fakePods) Delete(_ context.Context, namespace, name string) error {
+	f.namespace = namespace
+	f.name = name
+	f.deleted = true
+	return nil
+}
+
 type fakePortForwarder struct {
 	options kubectl.PortForwardOptions
+}
+
+type fakeExecutor struct {
+	options kubectl.ExecOptions
+}
+
+func (f *fakeExecutor) Exec(
+	_ context.Context,
+	_ io.Reader,
+	_, _ io.Writer,
+	options kubectl.ExecOptions,
+) error {
+	f.options = options
+	return nil
 }
 
 func (f *fakePortForwarder) PortForward(
@@ -413,6 +443,140 @@ func TestPodsPortForwardRejectsInvalidPort(t *testing.T) {
 
 	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "--port must be between") {
 		t.Fatalf("Execute() error = %v, want invalid port error", err)
+	}
+}
+
+func TestPodsExecShowsContextAndRunsShell(t *testing.T) {
+	t.Parallel()
+
+	path := writeProfileTestConfig(t)
+	pods := &fakePods{containers: []string{"app"}}
+	executor := &fakeExecutor{}
+	command := NewRootCommand(Dependencies{
+		Runner: fakeRunner{},
+		Pods:   pods,
+		Exec:   executor,
+	})
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetArgs([]string{"--config", path, "pods", "exec", "api-abc"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	want := kubectl.ExecOptions{
+		Namespace: "api",
+		Pod:       "api-abc",
+		Container: "app",
+		Command:   "/bin/sh",
+	}
+	if !reflect.DeepEqual(executor.options, want) {
+		t.Fatalf("options = %#v, want %#v", executor.options, want)
+	}
+	for _, expected := range []string{"Profile: staging", "Project: company-staging", "Pod: api-abc", "Container: app"} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("output does not contain %q:\n%s", expected, output.String())
+		}
+	}
+}
+
+func TestPodsExecProductionRequiresConfirmation(t *testing.T) {
+	t.Parallel()
+
+	path := writeProfileTestConfig(t)
+	cfg, err := (config.Store{Path: path}).Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	profile := cfg.Profiles["staging"]
+	profile.Production = true
+	cfg.Profiles["staging"] = profile
+	if err := (config.Store{Path: path}).Save(cfg); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+
+	executor := &fakeExecutor{}
+	command := NewRootCommand(Dependencies{
+		Runner: fakeRunner{},
+		Pods:   &fakePods{containers: []string{"app"}},
+		Exec:   executor,
+	})
+	var output bytes.Buffer
+	command.SetIn(strings.NewReader("\n"))
+	command.SetOut(&output)
+	command.SetArgs([]string{"--config", path, "pods", "exec", "api-abc"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if executor.options.Pod != "" {
+		t.Fatalf("exec ran with options %#v", executor.options)
+	}
+	if !strings.Contains(output.String(), "Production profile. Open this shell?") ||
+		!strings.Contains(output.String(), "Exec cancelled.") {
+		t.Fatalf("unexpected output:\n%s", output.String())
+	}
+}
+
+func TestPodsRestartRequiresControllerAndConfirmation(t *testing.T) {
+	t.Parallel()
+
+	path := writeProfileTestConfig(t)
+	pods := &fakePods{actionInfo: kube.PodActionInfo{ControllerOwner: "ReplicaSet/api-123"}}
+	command := NewRootCommand(Dependencies{Runner: fakeRunner{}, Pods: pods})
+	var output bytes.Buffer
+	command.SetIn(strings.NewReader("y\n"))
+	command.SetOut(&output)
+	command.SetArgs([]string{"--config", path, "pods", "restart", "api-abc"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if !pods.deleted || !strings.Contains(output.String(), "will recreate it") {
+		t.Fatalf("deleted = %t, output:\n%s", pods.deleted, output.String())
+	}
+}
+
+func TestPodsRestartBlocksUnmanagedPod(t *testing.T) {
+	t.Parallel()
+
+	path := writeProfileTestConfig(t)
+	pods := &fakePods{}
+	command := NewRootCommand(Dependencies{Runner: fakeRunner{}, Pods: pods})
+	command.SetArgs([]string{"--config", path, "pods", "restart", "api-abc"})
+
+	if err := command.Execute(); err == nil || !strings.Contains(err.Error(), "no controller owner") {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if pods.deleted {
+		t.Fatal("unmanaged pod was deleted")
+	}
+}
+
+func TestPodsDeleteProductionRequiresExactPodName(t *testing.T) {
+	t.Parallel()
+
+	path := writeProfileTestConfig(t)
+	cfg, err := (config.Store{Path: path}).Load()
+	if err != nil {
+		t.Fatalf("Load() error = %v", err)
+	}
+	profile := cfg.Profiles["staging"]
+	profile.Production = true
+	cfg.Profiles["staging"] = profile
+	if err := (config.Store{Path: path}).Save(cfg); err != nil {
+		t.Fatalf("Save() error = %v", err)
+	}
+	pods := &fakePods{}
+	command := NewRootCommand(Dependencies{Runner: fakeRunner{}, Pods: pods})
+	command.SetIn(strings.NewReader("wrong-name\n"))
+	command.SetArgs([]string{"--config", path, "pods", "delete", "api-abc"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	if pods.deleted {
+		t.Fatal("production pod was deleted with wrong confirmation")
 	}
 }
 

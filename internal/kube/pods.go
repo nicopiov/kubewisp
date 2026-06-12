@@ -19,6 +19,8 @@ type PodService interface {
 	Containers(ctx context.Context, namespace, name string) ([]string, error)
 	Ports(ctx context.Context, namespace, name string) ([]PodPort, error)
 	Logs(ctx context.Context, options PodLogsOptions) (io.ReadCloser, error)
+	ActionInfo(ctx context.Context, namespace, name string) (PodActionInfo, error)
+	Delete(ctx context.Context, namespace, name string) error
 }
 
 type PodLogsOptions struct {
@@ -32,12 +34,20 @@ type PodLogsOptions struct {
 }
 
 type PodSummary struct {
-	Name      string
-	Ready     string
-	Status    string
-	Restarts  int32
-	CreatedAt time.Time
-	Node      string
+	Name          string
+	Ready         string
+	Status        string
+	Restarts      int32
+	CreatedAt     time.Time
+	Node          string
+	LastRestartAt time.Time
+	OwnerKind     string
+	OwnerName     string
+}
+
+type PodActionInfo struct {
+	Owners          []string
+	ControllerOwner string
 }
 
 type PodPort struct {
@@ -228,6 +238,36 @@ func (s *Pods) Logs(ctx context.Context, options PodLogsOptions) (io.ReadCloser,
 	return stream, nil
 }
 
+func (s *Pods) ActionInfo(ctx context.Context, namespace, name string) (PodActionInfo, error) {
+	client, err := s.client()
+	if err != nil {
+		return PodActionInfo{}, err
+	}
+	pod, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return PodActionInfo{}, diagnose(fmt.Sprintf("get pod %q in namespace %q", name, namespace), err)
+	}
+	info := PodActionInfo{Owners: ownerNames(pod.OwnerReferences)}
+	for _, owner := range pod.OwnerReferences {
+		if owner.Controller != nil && *owner.Controller {
+			info.ControllerOwner = owner.Kind + "/" + owner.Name
+			break
+		}
+	}
+	return info, nil
+}
+
+func (s *Pods) Delete(ctx context.Context, namespace, name string) error {
+	client, err := s.client()
+	if err != nil {
+		return err
+	}
+	if err := client.CoreV1().Pods(namespace).Delete(ctx, name, metav1.DeleteOptions{}); err != nil {
+		return diagnose(fmt.Sprintf("delete pod %q in namespace %q", name, namespace), err)
+	}
+	return nil
+}
+
 type podLogStream func(context.Context, kubernetes.Interface, PodLogsOptions) (io.ReadCloser, error)
 
 func streamPodLogs(
@@ -256,20 +296,29 @@ func (s *Pods) client() (kubernetes.Interface, error) {
 func summarizePod(pod *corev1.Pod) PodSummary {
 	ready := 0
 	var restarts int32
+	var lastRestartAt time.Time
 	for _, status := range pod.Status.ContainerStatuses {
 		if status.Ready {
 			ready++
 		}
 		restarts += status.RestartCount
+		if terminated := status.LastTerminationState.Terminated; terminated != nil &&
+			terminated.FinishedAt.Time.After(lastRestartAt) {
+			lastRestartAt = terminated.FinishedAt.Time
+		}
 	}
 
+	ownerKind, ownerName := controllerOwner(pod.OwnerReferences)
 	return PodSummary{
-		Name:      pod.Name,
-		Ready:     fmt.Sprintf("%d/%d", ready, len(pod.Spec.Containers)),
-		Status:    podStatus(pod),
-		Restarts:  restarts,
-		CreatedAt: pod.CreationTimestamp.Time,
-		Node:      pod.Spec.NodeName,
+		Name:          pod.Name,
+		Ready:         fmt.Sprintf("%d/%d", ready, len(pod.Spec.Containers)),
+		Status:        podStatus(pod),
+		Restarts:      restarts,
+		CreatedAt:     pod.CreationTimestamp.Time,
+		Node:          pod.Spec.NodeName,
+		LastRestartAt: lastRestartAt,
+		OwnerKind:     ownerKind,
+		OwnerName:     ownerName,
 	}
 }
 
@@ -472,6 +521,15 @@ func ownerNames(references []metav1.OwnerReference) []string {
 	}
 	sort.Strings(owners)
 	return owners
+}
+
+func controllerOwner(references []metav1.OwnerReference) (string, string) {
+	for _, reference := range references {
+		if reference.Controller != nil && *reference.Controller {
+			return reference.Kind, reference.Name
+		}
+	}
+	return "", ""
 }
 
 func sortedPairs(values map[string]string) []string {

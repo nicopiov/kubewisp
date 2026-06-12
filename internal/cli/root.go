@@ -20,7 +20,10 @@ type Dependencies struct {
 	Connectivity kube.ConnectivityChecker
 	Namespaces   kube.NamespaceService
 	Pods         kube.PodService
+	Workloads    kube.WorkloadService
+	Events       kube.EventService
 	PortForward  kubectl.PortForwarder
+	Exec         kubectl.Executor
 	Selector     selector.Service
 	TUI          tui.Service
 	Version      string
@@ -59,6 +62,8 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 	command.AddCommand(newClusterCommand(dependencies, &configPath))
 	command.AddCommand(newNamespaceCommand(dependencies, &configPath))
 	command.AddCommand(newPodsCommand(dependencies, &configPath))
+	command.AddCommand(newWorkloadsCommand(dependencies, &configPath))
+	command.AddCommand(newEventsCommand(dependencies, &configPath))
 	command.AddCommand(newProfileCommand(&configPath))
 	command.AddCommand(newTUICommand(dependencies, &configPath))
 	command.AddCommand(newVersionCommand(dependencies.Version))

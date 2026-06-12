@@ -33,7 +33,7 @@ dashboard:
 Dashboard controls:
 
 ```text
-1 / 2 / 3 / 4   dashboard / namespaces / pods / doctor
+1 / 2 / 3 / 4 / 5 / 6   dashboard / namespaces / pods / workloads / events / doctor
 tab / left/right navigate screens
 up/down / j/k   navigate lists
 enter           switch selected namespace
@@ -45,16 +45,27 @@ In the TUI pod screen, Enter opens troubleshooting details and `l` opens the
 latest 200 log lines. Press `p` from the pod list or details to select a
 declared TCP port and start `kubectl port-forward`. Multi-container pods open a
 container chooser. Use Up/Down or `j`/`k` to scroll details and logs, and Esc
-to return to the pod list.
+to return to the pod list. While port forwarding, Ctrl+C stops only the tunnel
+and returns to the Kubewisp TUI.
+
+Press `e` from the pod list or details to open `/bin/sh` in a selected
+container. Kubewisp shows the full target context before entering the shell.
+Production profiles require pressing `y` on the confirmation screen. Exiting
+the shell returns to the Pods screen.
 
 The dashboard, pod list, and pod details use text-backed colored health
 indicators:
 
 ```text
-● healthy     running, fully ready, and no restarts
-● warning     pending, partially ready, or restarted
+● healthy     running and fully ready; historical restarts remain visible
+● warning     pending, partially ready, or restarted within the last 10 minutes
 ● unhealthy   crash, error, failure, or image-pull states
 ```
+
+Batch workloads use lifecycle labels instead of service health labels. CronJobs
+are shown as `running`, `scheduled`, or `suspended`. Job-owned pods are shown as
+`running`, `pending`, `completed`, or unhealthy when they genuinely fail.
+Completed pods are counted separately from warnings on the dashboard.
 
 Pod details include owners, conditions, container images and states, requests,
 limits, ports, mounts, probes, environment variable names, volumes, labels,
@@ -105,6 +116,10 @@ kubewisp pods logs
 kubewisp pods logs <pod>
 kubewisp pods port-forward
 kubewisp pods port-forward <pod>
+kubewisp pods exec
+kubewisp pods exec <pod>
+kubewisp pods delete <pod>
+kubewisp pods restart <pod>
 ```
 
 Running `pods describe` or `pods logs` without a pod name opens a keyboard
@@ -130,12 +145,64 @@ Application logs may contain sensitive values because Kubewisp prints the log
 stream exactly as the workload produced it.
 
 Port forwarding selects a pod and declared TCP container port interactively.
-The local port defaults to the remote port, and Kubewisp hands the terminal to
-`kubectl` until Ctrl+C stops the tunnel. Direct ports are also supported:
+The local port defaults to the remote port, and Kubewisp temporarily hands the
+terminal to `kubectl`. In the TUI, Ctrl+C stops the tunnel and resumes Kubewisp.
+Direct CLI ports are also supported:
 
 ```bash
 kubewisp pods port-forward <pod> --port 8080
 kubewisp pods port-forward <pod> --port 8080 --local-port 18080
+```
+
+Pod exec selects the pod and container interactively, shows the complete target
+context, and requires confirmation for production profiles:
+
+```bash
+kubewisp pods exec <pod>
+kubewisp pods exec <pod> --container app
+kubewisp pods exec <pod> --container app --shell /bin/bash
+```
+
+Pod delete and restart are guarded destructive actions. Both always show the
+full target context and require confirmation. Production profiles require
+typing the exact pod name. Restart is implemented as pod deletion and is
+blocked unless Kubernetes reports a controller owner that can recreate it.
+
+In the TUI, press `d` to delete or uppercase `R` to restart the selected pod.
+
+The Workloads screen combines Deployments, StatefulSets, DaemonSets, and
+CronJobs. Replica workloads show ready, desired, updated, and available counts.
+CronJobs show their schedule, active runs, suspended state, and latest run.
+Press Enter on a CronJob to inspect its settings and recent Jobs. Press `s`
+from the CronJob row or details to review and toggle between active and
+suspended scheduling.
+Press uppercase `R` on a Deployment, StatefulSet, or DaemonSet to review and
+trigger a rollout restart. This restarts every pod managed by the selected
+workload, always requires confirmation, and requires typing the exact
+`Kind/name` for production profiles. CronJobs do not support rollout restart.
+
+Suspend and resume always require confirmation. Production profiles require
+typing the exact `CronJob/name`.
+
+Workload CLI commands:
+
+```bash
+kubewisp workloads list
+kubewisp workloads restart
+kubewisp workloads restart Deployment/api
+kubewisp workloads cronjob describe
+kubewisp workloads cronjob describe cleanup
+kubewisp workloads cronjob suspend cleanup
+kubewisp workloads cronjob resume cleanup
+```
+
+The Events screen groups repeated Warning events across the selected namespace
+and sorts them by most recently seen. Press Enter on a pod event to open its
+troubleshooting details, or on a Deployment, StatefulSet, DaemonSet, or CronJob
+event to jump to that workload. The same feed is available from the CLI:
+
+```bash
+kubewisp events
 ```
 
 For development and tests, override the config location with `--config <path>`
