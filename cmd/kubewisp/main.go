@@ -1,0 +1,37 @@
+package main
+
+import (
+	"fmt"
+	"os"
+
+	"github.com/nicopiov/kubewisp/internal/cli"
+	"github.com/nicopiov/kubewisp/internal/doctor"
+	"github.com/nicopiov/kubewisp/internal/kube"
+	"github.com/nicopiov/kubewisp/internal/kubectl"
+	"github.com/nicopiov/kubewisp/internal/runner"
+	"github.com/nicopiov/kubewisp/internal/selector"
+	"github.com/nicopiov/kubewisp/internal/tui"
+)
+
+func main() {
+	connectivity := kube.NewConnectivityChecker()
+	namespaces := kube.NewNamespaceService()
+	pods := kube.NewPodService()
+	commandRunner := runner.NewOSRunner()
+	doctorReporter := doctor.NewService(commandRunner)
+	kubectlService := kubectl.NewService(commandRunner)
+	command := cli.NewRootCommand(cli.Dependencies{
+		Runner:       commandRunner,
+		Connectivity: connectivity,
+		Namespaces:   namespaces,
+		Pods:         pods,
+		PortForward:  kubectlService,
+		Selector:     selector.NewTerminal(),
+		TUI:          tui.NewRunner(connectivity, namespaces, pods, doctorReporter, kubectlService),
+	})
+
+	if err := command.Execute(); err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
+}
