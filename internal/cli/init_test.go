@@ -106,6 +106,36 @@ func TestInitDiscoversClusterAndSavesProfile(t *testing.T) {
 	}
 }
 
+func TestProfileAddUsesGuidedSetup(t *testing.T) {
+	t.Parallel()
+
+	path := filepath.Join(t.TempDir(), "config.yaml")
+	commandRunner := &initRunner{results: []runner.CommandResult{
+		{Stdout: "developer@company.com\n"},
+		{Stdout: "company-staging\n"},
+		{Stdout: `[{"name":"staging-main","location":"europe-west1"}]`},
+		{},
+		{},
+	}}
+	command := NewRootCommand(Dependencies{
+		Runner:       commandRunner,
+		Connectivity: initConnectivity{report: kube.ConnectivityReport{ServerVersion: "v1.32.1"}},
+	})
+	var output bytes.Buffer
+	command.SetIn(strings.NewReader("\n\n\n"))
+	command.SetOut(&output)
+	command.SetErr(&output)
+	command.SetArgs([]string{"--config", path, "profile", "add"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v\n%s", err, output.String())
+	}
+	cfg, err := (config.Store{Path: path}).Load()
+	if err != nil || cfg.CurrentProfile != "staging-main" {
+		t.Fatalf("profile add config = %#v, error = %v", cfg, err)
+	}
+}
+
 func TestInitLogsInWhenNoAccountIsActive(t *testing.T) {
 	t.Parallel()
 
@@ -138,8 +168,8 @@ func TestInitLogsInWhenNoAccountIsActive(t *testing.T) {
 	if got := len(commandRunner.interactiveCalls); got != 1 {
 		t.Fatalf("interactive calls = %d, want 1", got)
 	}
-	if got := commandRunner.interactiveCalls[0].args; !reflect.DeepEqual(got, []string{"auth", "login"}) {
-		t.Fatalf("interactive args = %#v, want auth login", got)
+	if got := commandRunner.interactiveCalls[0].args; !reflect.DeepEqual(got, []string{"auth", "login", "--quiet"}) {
+		t.Fatalf("interactive args = %#v, want quiet auth login", got)
 	}
 }
 

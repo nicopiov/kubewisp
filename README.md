@@ -1,237 +1,259 @@
 # Kubewisp
 
-Kubewisp is an early-stage Go CLI/TUI for safely navigating and operating GKE
-clusters.
+Kubewisp is a keyboard-driven Go CLI and TUI for navigating GKE clusters,
+troubleshooting Kubernetes resources, and performing common operations with
+production-aware safeguards.
 
-## Current Status
+It uses `gcloud` for Google authentication and `client-go` for Kubernetes API
+access. Kubewisp never stores Google credentials or Secret values.
 
-Build Kubewisp and run the guided setup:
+## Features
+
+- Guided GKE setup and profile management
+- Automatic expired-session reauthentication
+- Live profile and namespace switching
+- Responsive dashboard with cluster, pod-health, and dependency cards
+- Pod details, logs, exec, port-forward, guarded delete, and restart
+- Deployment, StatefulSet, DaemonSet, and CronJob visibility
+- Guarded rollout restart and CronJob suspend/resume
+- Workload-to-pod drill-down
+- Service, Ingress, endpoint, and route inspection
+- Grouped namespace Warning events with resource drill-down
+
+## Requirements
+
+- Go 1.26 or newer when building from source
+- `gcloud`
+- `kubectl`
+- `gke-gcloud-auth-plugin`
+
+Check local dependencies with:
 
 ```bash
-make build
-./bin/kubewisp doctor
-./bin/kubewisp init
-./bin/kubewisp cluster status
+kubewisp doctor
 ```
 
-Install a published version with Go:
+## Installation
+
+Install with Go:
 
 ```bash
 go install github.com/nicopiov/kubewisp/cmd/kubewisp@latest
 kubewisp version
+```
+
+Or build the repository:
+
+```bash
+make build
+./bin/kubewisp version
+```
+
+## First Run
+
+Run the guided setup:
+
+```bash
 kubewisp init
 ```
 
-After initialization, running Kubewisp without a subcommand opens the TUI
-dashboard:
+Kubewisp will:
+
+1. Check required local tools.
+2. Authenticate through `gcloud` when needed.
+3. Discover accessible Google Cloud projects and GKE clusters.
+4. Fetch cluster credentials.
+5. Verify Kubernetes API and namespace access.
+6. Save a local Kubewisp profile.
+
+OAuth login happens in the browser. Kubewisp runs `gcloud auth login --quiet`,
+so after browser authentication no terminal input is required. The process may
+take a few seconds to finish and print informational project suggestions before
+returning to Kubewisp.
+
+## Opening Kubewisp
 
 ```bash
-./bin/kubewisp
-./bin/kubewisp tui
+kubewisp
+# or
+kubewisp tui
 ```
 
-Dashboard controls:
+Before opening the dashboard, Kubewisp prints each startup step while it loads
+profiles, activates the Google Cloud project, refreshes GKE credentials, and
+verifies Kubernetes access.
 
-```text
-1 / 2 / 3 / 4 / 5 / 6   dashboard / namespaces / pods / workloads / events / doctor
-tab / left/right navigate screens
-up/down / j/k   navigate lists
-enter           switch selected namespace
-r               refresh current screen
-q               quit
-```
+If the gcloud session expired, Kubewisp offers to launch browser OAuth login
+and retries the connection automatically.
 
-In the TUI pod screen, Enter opens troubleshooting details and `l` opens the
-latest 200 log lines. Press `p` from the pod list or details to select a
-declared TCP port and start `kubectl port-forward`. Multi-container pods open a
-container chooser. Use Up/Down or `j`/`k` to scroll details and logs, and Esc
-to return to the pod list. While port forwarding, Ctrl+C stops only the tunnel
-and returns to the Kubewisp TUI.
+When multiple profiles exist, startup opens an arrow-key profile selector and
+remembers the selected profile.
 
-Press `e` from the pod list or details to open `/bin/sh` in a selected
-container. Kubewisp shows the full target context before entering the shell.
-Production profiles require pressing `y` on the confirmation screen. Exiting
-the shell returns to the Pods screen.
+## TUI Navigation
 
-The dashboard, pod list, and pod details use text-backed colored health
-indicators:
+| Key | Action |
+| --- | --- |
+| `1`-`7` | Open Dashboard, Namespaces, Pods, Workloads, Network, Events, or Doctor |
+| `Tab`, `Left`, `Right` | Move between top-level screens |
+| `Up`, `Down`, `j`, `k` | Navigate lists or scroll details |
+| `Enter` | Open or select the highlighted resource |
+| `r` | Refresh the current screen |
+| `P` | Manage and switch profiles |
+| `Esc` | Return to the previous screen |
+| `q` | Quit |
 
-```text
-● healthy     running and fully ready; historical restarts remain visible
-● warning     pending, partially ready, or restarted within the last 10 minutes
-● unhealthy   crash, error, failure, or image-pull states
-```
+The contextual help bar changes with the selected resource, compacts on smaller
+terminals, and wraps at action boundaries.
 
-Batch workloads use lifecycle labels instead of service health labels. CronJobs
-are shown as `running`, `scheduled`, or `suspended`. Job-owned pods are shown as
-`running`, `pending`, `completed`, or unhealthy when they genuinely fail.
-Completed pods are counted separately from warnings on the dashboard.
+### Dashboard
 
-Pod details include owners, conditions, container images and states, requests,
-limits, ports, mounts, probes, environment variable names, volumes, labels,
-annotation names, and recent events.
+The Dashboard shows responsive cards for:
 
-The Doctor screen shows local dependency checks and verifies Kubernetes API and
-selected namespace access. Press `r` to rerun the checks.
+- Active project, cluster, region or zone, namespace, and Kubernetes version
+- Healthy, completed, warning, and unhealthy pod counts
+- Availability of `gcloud`, `kubectl`, and `gke-gcloud-auth-plugin`
 
-`kubewisp init` uses the active `gcloud` account or launches `gcloud auth
-login`, discovers accessible projects and GKE clusters, fetches cluster
-credentials, and saves the selected profile automatically.
+Cards sit side by side in wide terminals and stack in narrow terminals.
 
-`kubewisp cluster status` uses client-go to verify the Kubernetes API and the
-saved profile namespace are accessible.
+### Profiles
 
-Kubewisp never stores Google credentials. It stores only local preferences in
-`~/.config/kubewisp/config.yaml`; users normally do not need to create, inspect,
-or specify this file. The doctor checks for `gcloud`, `kubectl`, and
-`gke-gcloud-auth-plugin`.
+Press `P` from a top-level screen:
 
-Available profile commands:
+- `Enter`: connect and switch without restarting Kubewisp
+- `r`: rename a profile
+- `d`: delete a non-active profile after confirmation
+
+Live switching refreshes GKE credentials, resets the Kubernetes client, clears
+cached cluster data, and reloads the dashboard.
+
+### Pods
+
+| Key | Action |
+| --- | --- |
+| `Enter` | Open curated troubleshooting details |
+| `l` | View the latest 200 log lines |
+| `p` | Start `kubectl port-forward` |
+| `e` | Open a guarded `kubectl exec` shell |
+| `d` | Delete after confirmation |
+| `R` | Restart a controller-managed pod after confirmation |
+
+Pod details include owners, conditions, container states, images, resources,
+ports, mounts, probes, network identity, service account, QoS, labels,
+annotation names, and recent events. Environment and annotation values are not
+shown. Application logs are printed exactly as produced and may contain
+sensitive values.
+
+### Workloads
+
+The Workloads screen combines Deployments, StatefulSets, DaemonSets, and
+CronJobs.
+
+- Enter a replica workload for rollout details, conditions, images, and its
+  managed pods.
+- Press `R` for a guarded rollout restart.
+- Enter a CronJob for recent Jobs and scheduling details.
+- Press `s` to confirm suspend or resume.
+
+Production profiles require typing the exact resource reference for destructive
+or disruptive actions.
+
+### Network And Events
+
+The Network screen combines Services and Ingresses. Details include Service
+selectors, ready EndpointSlice addresses, Ingress routes, and Service backends.
+
+The Events screen groups repeated namespace Warning events and drills into
+affected pods and supported workloads.
+
+## CLI Commands
+
+Use `kubewisp --help` or `kubewisp <command> --help` for complete command help
+and flags.
 
 ```bash
+# Profiles and setup
+kubewisp init
+kubewisp profile add
 kubewisp profile list
 kubewisp profile show [name]
 kubewisp profile use <name>
-```
+kubewisp profile rename <old-name> <new-name>
+kubewisp profile delete <name>
 
-Namespace commands use the current profile and do not modify kubeconfig:
-
-```bash
+# Cluster and namespace
+kubewisp cluster status
 kubewisp namespace list
-kubewisp namespace switch
-kubewisp namespace switch <namespace>
-```
+kubewisp namespace switch [namespace]
 
-Running `namespace switch` without a name opens an interactive selector. Use
-the arrow keys or `j`/`k` to navigate, Enter to select, and Esc or `q` to
-cancel. Passing a namespace directly remains available for scripts.
-
-Pod commands inspect the namespace selected for the current profile:
-
-```bash
+# Pods
 kubewisp pods list
-kubewisp pods describe
-kubewisp pods describe <pod>
-kubewisp pods logs
-kubewisp pods logs <pod>
-kubewisp pods port-forward
-kubewisp pods port-forward <pod>
-kubewisp pods exec
-kubewisp pods exec <pod>
+kubewisp pods describe [pod]
+kubewisp pods logs [pod] --tail 500 --follow
+kubewisp pods exec [pod] --container app --shell /bin/bash
+kubewisp pods port-forward [pod] --port 8080 --local-port 18080
 kubewisp pods delete <pod>
 kubewisp pods restart <pod>
-```
 
-Running `pods describe` or `pods logs` without a pod name opens a keyboard
-selector showing pod status, readiness, and restart count. Passing a pod name
-directly remains available for scripts.
-
-Pod describe is a curated, safe troubleshooting view rather than raw `kubectl
-describe` output. It includes conditions, current and previous container states,
-exit codes, resources, mounts, probes, pod and host IPs, service account, QoS,
-and recent events. It shows environment variable names and annotation names
-only, and never queries or renders Secret values.
-
-Pod logs default to the latest 200 lines. Single-container pods are selected
-automatically; multi-container pods open the keyboard selector.
-
-```bash
-kubewisp pods logs <pod> --tail 500
-kubewisp pods logs <pod> -c <container> --follow
-kubewisp pods logs <pod> --previous --timestamps
-```
-
-Application logs may contain sensitive values because Kubewisp prints the log
-stream exactly as the workload produced it.
-
-Port forwarding selects a pod and declared TCP container port interactively.
-The local port defaults to the remote port, and Kubewisp temporarily hands the
-terminal to `kubectl`. In the TUI, Ctrl+C stops the tunnel and resumes Kubewisp.
-Direct CLI ports are also supported:
-
-```bash
-kubewisp pods port-forward <pod> --port 8080
-kubewisp pods port-forward <pod> --port 8080 --local-port 18080
-```
-
-Pod exec selects the pod and container interactively, shows the complete target
-context, and requires confirmation for production profiles:
-
-```bash
-kubewisp pods exec <pod>
-kubewisp pods exec <pod> --container app
-kubewisp pods exec <pod> --container app --shell /bin/bash
-```
-
-Pod delete and restart are guarded destructive actions. Both always show the
-full target context and require confirmation. Production profiles require
-typing the exact pod name. Restart is implemented as pod deletion and is
-blocked unless Kubernetes reports a controller owner that can recreate it.
-
-In the TUI, press `d` to delete or uppercase `R` to restart the selected pod.
-
-The Workloads screen combines Deployments, StatefulSets, DaemonSets, and
-CronJobs. Replica workloads show ready, desired, updated, and available counts.
-CronJobs show their schedule, active runs, suspended state, and latest run.
-The help line changes with the selected resource so it shows only valid
-actions. Press Enter on a Deployment, StatefulSet, or DaemonSet to inspect its
-rollout health, strategy, selector, service account, pod-template images, and
-conditions. From that detail view, press `p` to list only the pods selected by
-the workload. Press Enter to inspect one of those pods or `l` to view its logs;
-returning from either keeps you in the workload's filtered pod list.
-Press Enter on a CronJob to inspect its settings and recent Jobs. Press `s`
-from the CronJob row or details to review and toggle between active and
-suspended scheduling.
-Press uppercase `R` on a Deployment, StatefulSet, or DaemonSet to review and
-trigger a rollout restart. This restarts every pod managed by the selected
-workload, always requires confirmation, and requires typing the exact
-`Kind/name` for production profiles. CronJobs do not support rollout restart.
-
-Suspend and resume always require confirmation. Production profiles require
-typing the exact `CronJob/name`.
-
-The Network screen combines Services and Ingresses for the selected namespace.
-It shows Service types, addresses, ports, Ingress classes, and hosts. Press
-Enter to inspect Service selectors and ready endpoints, or Ingress routes and
-their Service backends.
-
-Kubewisp reuses one Kubernetes API client for the process. Recently visited
-top-level TUI tabs remain cached for 15 seconds to make navigation immediate;
-press `r` at any time to force a fresh API read. Multi-kind Workloads and
-Network lists fetch their independent Kubernetes resources concurrently.
-
-Workload CLI commands:
-
-```bash
+# Workloads and events
 kubewisp workloads list
-kubewisp workloads restart
-kubewisp workloads restart Deployment/api
-kubewisp workloads cronjob describe
-kubewisp workloads cronjob describe cleanup
-kubewisp workloads cronjob suspend cleanup
-kubewisp workloads cronjob resume cleanup
-```
-
-The Events screen groups repeated Warning events across the selected namespace
-and sorts them by most recently seen. Press Enter on a pod event to open its
-troubleshooting details, or on a Deployment, StatefulSet, DaemonSet, or CronJob
-event to jump to that workload. The same feed is available from the CLI:
-
-```bash
+kubewisp workloads restart [kind/name]
+kubewisp workloads cronjob describe [name]
+kubewisp workloads cronjob suspend [name]
+kubewisp workloads cronjob resume [name]
 kubewisp events
 ```
 
-For development and tests, override the config location with `--config <path>`
-or `KUBEWISP_CONFIG`. A `config.example.yaml` fixture is included for manual
-command testing.
+Commands with optional resource names open a keyboard selector when the name is
+omitted.
 
-See [ROADMAP.md](ROADMAP.md) for the proposed architecture, milestones, testing
-strategy, and current decisions.
+## Safety
+
+- Kubewisp stores preferences only in `~/.config/kubewisp/config.yaml`.
+- Profile deletion removes only local Kubewisp configuration, never a cluster.
+- Namespace switching does not modify the kubeconfig namespace.
+- Pod deletion, pod restart, rollout restart, and CronJob state changes require
+  confirmation.
+- Production profiles require stronger exact-name confirmation.
+- Pod restart is blocked when Kubernetes reports no controller that can
+  recreate the pod.
+
+## Performance
+
+Kubewisp reuses one Kubernetes client, fetches independent resource kinds
+concurrently, and caches recently visited top-level tabs for 15 seconds.
+Press `r` to force a fresh API read.
+
+## Troubleshooting
+
+Run:
+
+```bash
+kubewisp doctor
+kubewisp cluster status
+```
+
+If authentication expired, launch Kubewisp again and accept its reauthentication
+prompt, or run:
+
+```bash
+gcloud auth login
+```
+
+If OAuth succeeds in the browser but the terminal still shows gcloud output,
+wait for the command to finish. Kubewisp uses quiet login and does not require
+pressing Enter.
 
 ## Development
 
-Requires Go 1.26.
-
 ```bash
+make fmt
+make test
 make verify
+make test-race
 ```
+
+Tests use injected command runners and fake Kubernetes clients; the default
+suite does not require Google credentials, a cluster, or network access.
+
+Override the config location during development with `--config <path>` or
+`KUBEWISP_CONFIG`.

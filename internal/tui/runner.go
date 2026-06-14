@@ -18,6 +18,10 @@ type Service interface {
 	Run(ctx context.Context, input io.Reader, output io.Writer, configPath string) error
 }
 
+type ProfileConnector interface {
+	Connect(ctx context.Context, profile config.Profile) error
+}
+
 type Runner struct {
 	connectivity kube.ConnectivityChecker
 	namespaces   kube.NamespaceService
@@ -28,6 +32,7 @@ type Runner struct {
 	doctor       doctor.Reporter
 	portForward  kubectl.PortForwarder
 	exec         kubectl.Executor
+	profiles     ProfileConnector
 }
 
 func NewRunner(
@@ -40,6 +45,7 @@ func NewRunner(
 	doctorReporter doctor.Reporter,
 	portForwarder kubectl.PortForwarder,
 	executor kubectl.Executor,
+	profileConnector ProfileConnector,
 ) *Runner {
 	return &Runner{
 		connectivity: connectivity,
@@ -51,6 +57,7 @@ func NewRunner(
 		doctor:       doctorReporter,
 		portForward:  portForwarder,
 		exec:         executor,
+		profiles:     profileConnector,
 	}
 }
 
@@ -84,6 +91,7 @@ func (r *Runner) Run(ctx context.Context, input io.Reader, output io.Writer, con
 		Doctor:       r.doctor,
 		PortForward:  r.portForward,
 		Exec:         r.exec,
+		Profiles:     r.profiles,
 	})
 
 	_, err = tea.NewProgram(

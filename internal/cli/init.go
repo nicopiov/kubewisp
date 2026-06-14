@@ -19,7 +19,13 @@ func newInitCommand(dependencies Dependencies, configPath *string) *cobra.Comman
 	return &cobra.Command{
 		Use:   "init",
 		Short: "Authenticate, select a GKE cluster, and create a profile",
-		Args:  cobra.NoArgs,
+		Long: `Run the guided first-time setup.
+
+Kubewisp checks local dependencies, authenticates with gcloud, discovers
+accessible projects and GKE clusters, fetches cluster credentials, verifies
+Kubernetes access, and saves a local profile.`,
+		Example: "  kubewisp init",
+		Args:    cobra.NoArgs,
 		RunE: func(command *cobra.Command, _ []string) error {
 			dependencyReport := doctor.NewService(dependencies.Runner).Run(command.Context())
 			if !dependencyReport.Healthy() {
@@ -172,6 +178,14 @@ func newInitCommand(dependencies Dependencies, configPath *string) *cobra.Comman
 	}
 }
 
+func newProfileAddCommand(dependencies Dependencies, configPath *string) *cobra.Command {
+	command := newInitCommand(dependencies, configPath)
+	command.Use = "add"
+	command.Short = "Authenticate, select a GKE cluster, and add a profile"
+	command.Example = "  kubewisp profile add"
+	return command
+}
+
 func reauthenticateGcloud(
 	command *cobra.Command,
 	reader *bufio.Reader,
@@ -185,9 +199,12 @@ func reauthenticateGcloud(
 	if !login {
 		return "", errors.New("Google Cloud reauthentication is required; run `gcloud auth login` and retry")
 	}
+	fmt.Fprintln(output, "Opening Google OAuth login in your browser...")
+	fmt.Fprintln(output, "Waiting for gcloud to finish authentication; no terminal input is required.")
 	if err := client.Login(command.Context(), reader, output, command.ErrOrStderr()); err != nil {
 		return "", err
 	}
+	fmt.Fprintln(output, "Google Cloud authentication completed.")
 	account, err := client.ActiveAccount(command.Context())
 	if err != nil {
 		return "", err

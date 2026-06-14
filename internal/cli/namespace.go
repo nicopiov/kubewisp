@@ -13,6 +13,10 @@ func newNamespaceCommand(dependencies Dependencies, configPath *string) *cobra.C
 	command := &cobra.Command{
 		Use:   "namespace",
 		Short: "List and select Kubernetes namespaces",
+		Example: `  kubewisp namespace list
+  kubewisp namespace switch
+  kubewisp namespace switch api`,
+		Args: cobra.NoArgs,
 	}
 	command.AddCommand(
 		newNamespaceListCommand(dependencies, configPath),

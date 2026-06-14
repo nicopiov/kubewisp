@@ -10,6 +10,7 @@ import (
 	"time"
 
 	tea "github.com/charmbracelet/bubbletea"
+	"github.com/charmbracelet/lipgloss"
 	"github.com/nicopiov/kubewisp/internal/config"
 	"github.com/nicopiov/kubewisp/internal/doctor"
 	"github.com/nicopiov/kubewisp/internal/kube"
@@ -125,6 +126,15 @@ type fakeExecutor struct {
 	err     error
 }
 
+type fakeProfileConnector struct {
+	profile config.Profile
+}
+
+func (f *fakeProfileConnector) Connect(_ context.Context, profile config.Profile) error {
+	f.profile = profile
+	return nil
+}
+
 func (f *fakeExecutor) Exec(
 	_ context.Context,
 	_ io.Reader,
@@ -189,6 +199,10 @@ func testDependencies(t *testing.T) Dependencies {
 		LocationType:     config.LocationRegion,
 		Location:         "europe-west1",
 		DefaultNamespace: "api",
+	}
+	cfg.Profiles["production"] = config.Profile{
+		Provider: config.ProviderGKE, ProjectID: "company-production", ClusterName: "production-main",
+		LocationType: config.LocationRegion, Location: "europe-west1", DefaultNamespace: "default", Production: true,
 	}
 	if err := (config.Store{Path: path}).Save(cfg); err != nil {
 		t.Fatalf("Save() error = %v", err)
@@ -264,6 +278,7 @@ func testDependencies(t *testing.T) Dependencies {
 		}}}},
 		PortForward: &fakePortForwarder{},
 		Exec:        &fakeExecutor{},
+		Profiles:    &fakeProfileConnector{},
 		Pods: fakePods{pods: []kube.PodSummary{{
 			Name:      "api-abc",
 			Ready:     "1/1",
@@ -296,6 +311,72 @@ func testDependencies(t *testing.T) Dependencies {
 			Protocol:  "TCP",
 		}}, logs: "hello from app\n"},
 	}
+}
+
+func TestProfileScreenRenamesDeletesAndSwitches(t *testing.T) {
+	t.Parallel()
+
+	dependencies := testDependencies(t)
+	model := NewModel(dependencies)
+	model.loading = false
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	updated, _ = updated.(Model).Update(command())
+	profiles := updated.(Model)
+	if profiles.screen != profileScreen || !strings.Contains(profiles.View(), "staging (active)") {
+		t.Fatalf("unexpected profile screen:\n%s", profiles.View())
+	}
+
+	profiles.cursor = 0
+	updated, _ = profiles.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'r'}})
+	rename := updated.(Model)
+	updated, _ = rename.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("prod")})
+	updated, command = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, _ = updated.(Model).Update(command())
+	renamed := updated.(Model)
+	if !strings.Contains(renamed.status, "renamed to prod") {
+		t.Fatalf("rename status = %q", renamed.status)
+	}
+
+	renamed.cursor = 0
+	updated, _ = renamed.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'d'}})
+	updated, command = updated.(Model).Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	updated, _ = updated.(Model).Update(command())
+	deleted := updated.(Model)
+	if strings.Contains(deleted.View(), "\n> prod") || strings.Contains(deleted.View(), "\n  prod") {
+		t.Fatalf("deleted profile remains:\n%s", deleted.View())
+	}
+
+}
+
+func TestProfileScreenSwitchesLiveAndClearsClusterData(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.loading = false
+	model.pods = []kube.PodSummary{{Name: "old-cluster-pod"}}
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'P'}})
+	updated, _ = updated.(Model).Update(command())
+	profiles := updated.(Model)
+	profiles.cursor = 0
+
+	updated, command = profiles.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	updated, command = updated.(Model).Update(command())
+	updated, command = updated.(Model).Update(command())
+	updated, _ = updated.(Model).Update(command())
+	switched := updated.(Model)
+	if switched.dependencies.ProfileName != "production" || switched.screen != dashboardScreen ||
+		len(switched.pods) != 2 {
+		t.Fatalf("switched model = %#v", switched)
+	}
+	connector := dependenciesProfileConnector(switched.dependencies)
+	if connector.profile.ClusterName != "production-main" {
+		t.Fatalf("connected profile = %#v", connector.profile)
+	}
+}
+
+func dependenciesProfileConnector(dependencies Dependencies) *fakeProfileConnector {
+	return dependencies.Profiles.(*fakeProfileConnector)
 }
 
 func TestPodEnterLoadsDetails(t *testing.T) {
@@ -560,11 +641,56 @@ func TestDashboardLoadsConnectivity(t *testing.T) {
 		"Profile: staging",
 		"Cluster: staging-main",
 		"Connection: connected",
+		"Project: company-staging",
+		"Location: europe-west1",
+		"Local Dependencies",
+		"pass gcloud",
 		"healthy 1",
 		"unhealthy 1",
 	} {
 		if !strings.Contains(final.View(), expected) {
 			t.Fatalf("view does not contain %q:\n%s", expected, final.View())
+		}
+	}
+}
+
+func TestDashboardCardsRespondToTerminalWidth(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.loading = false
+	model.connectivity = kube.ConnectivityReport{ServerVersion: "v1.32.1"}
+	model.pods = []kube.PodSummary{{Ready: "1/1", Status: "Running"}}
+	model.doctorReport = testDependencies(t).Doctor.(fakeDoctor).report
+
+	model.width = 120
+	wide := model.dashboardView()
+	if strings.Count(wide, "╭") != 3 || strings.Count(strings.Split(wide, "\n")[0], "╭") != 3 {
+		t.Fatalf("wide dashboard cards are not side by side:\n%s", wide)
+	}
+
+	model.width = 80
+	narrow := model.dashboardView()
+	if strings.Count(strings.Split(narrow, "\n")[0], "╭") != 1 {
+		t.Fatalf("narrow dashboard cards are not stacked:\n%s", narrow)
+	}
+}
+
+func TestContextHelpCompactsAndWrapsAtTerminalWidth(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = podScreen
+	model.loading = false
+	model.width = 55
+
+	help := model.responsiveHelpView()
+	if !strings.Contains(help, "\n") || strings.Contains(help, "up/down navigate") {
+		t.Fatalf("help was not compacted and wrapped:\n%s", help)
+	}
+	for _, line := range strings.Split(help, "\n") {
+		if lipgloss.Width(line) > model.width {
+			t.Fatalf("help line width = %d, want <= %d: %q", lipgloss.Width(line), model.width, line)
 		}
 	}
 }

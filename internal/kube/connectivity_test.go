@@ -68,3 +68,17 @@ func TestDiagnoseMissingGKEAuthPlugin(t *testing.T) {
 		t.Fatalf("diagnose() error = %v, want missing plugin diagnostic", err)
 	}
 }
+
+func TestDiagnoseExpiredGcloudAuthBeforePluginWrapper(t *testing.T) {
+	t.Parallel()
+
+	err := diagnose(
+		"reach Kubernetes API",
+		errors.New("gke-gcloud-auth-plugin failed: reauthentication failed; cannot prompt during non-interactive execution; run gcloud auth login"),
+	)
+
+	if !strings.Contains(err.Error(), "Google Cloud authentication expired") ||
+		strings.Contains(err.Error(), "gke-gcloud-auth-plugin is required") {
+		t.Fatalf("diagnose() error = %v, want reauthentication guidance", err)
+	}
+}

@@ -19,6 +19,10 @@ func newWorkloadsCommand(dependencies Dependencies, configPath *string) *cobra.C
 	command := &cobra.Command{
 		Use:   "workloads",
 		Short: "Inspect and operate Kubernetes workloads",
+		Example: `  kubewisp workloads list
+  kubewisp workloads restart Deployment/api
+  kubewisp workloads cronjob describe cleanup`,
+		Args: cobra.NoArgs,
 	}
 	command.AddCommand(
 		newWorkloadsListCommand(dependencies, configPath),

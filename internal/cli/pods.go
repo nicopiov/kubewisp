@@ -20,6 +20,11 @@ func newPodsCommand(dependencies Dependencies, configPath *string) *cobra.Comman
 	command := &cobra.Command{
 		Use:   "pods",
 		Short: "Inspect pods in the selected namespace",
+		Example: `  kubewisp pods list
+  kubewisp pods describe
+  kubewisp pods logs api-abc --follow
+  kubewisp pods exec api-abc`,
+		Args: cobra.NoArgs,
 	}
 	command.AddCommand(
 		newPodsListCommand(dependencies, configPath),

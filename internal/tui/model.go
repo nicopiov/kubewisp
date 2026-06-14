@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"sort"
 	"strings"
 	"time"
 
@@ -39,6 +40,9 @@ const (
 	networkDetailsScreen
 	cronJobDetailsScreen
 	cronJobStateConfirmScreen
+	profileScreen
+	profileRenameScreen
+	profileDeleteConfirmScreen
 )
 
 type Dependencies struct {
@@ -54,6 +58,7 @@ type Dependencies struct {
 	Doctor       doctor.Reporter
 	PortForward  kubectl.PortForwarder
 	Exec         kubectl.Executor
+	Profiles     ProfileConnector
 }
 
 type Model struct {
@@ -97,6 +102,9 @@ type Model struct {
 	confirmationInput string
 	cronJobSuspended  bool
 	podBackScreen     screen
+	profileNames      []string
+	profileInput      string
+	selectedProfile   string
 }
 
 type connectivityMsg struct {
@@ -138,6 +146,12 @@ type doctorMsg struct {
 	report        doctor.Report
 	connection    kube.ConnectivityReport
 	connectionErr error
+}
+
+type dashboardDataMsg struct {
+	pods   []kube.PodSummary
+	report doctor.Report
+	err    error
 }
 
 type portsMsg struct {
@@ -207,6 +221,28 @@ type cronJobStateMsg struct {
 	err       error
 }
 
+type profilesMsg struct {
+	names []string
+	err   error
+}
+
+type profileSwitchedMsg struct {
+	name    string
+	profile config.Profile
+	err     error
+}
+
+type profileRenamedMsg struct {
+	oldName string
+	newName string
+	err     error
+}
+
+type profileDeletedMsg struct {
+	name string
+	err  error
+}
+
 var (
 	titleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
 	activeTabStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
@@ -233,12 +269,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.width = message.Width
 		m.height = message.Height
 	case connectivityMsg:
-		m.loading = false
 		m.err = message.err
 		m.connectivity = message.report
 		if message.err == nil {
-			return m, m.loadPods()
+			m.loading = true
+			return m, m.loadDashboardData()
 		}
+		m.loading = false
 	case namespacesMsg:
 		m.loading = false
 		m.err = message.err
@@ -328,6 +365,13 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.doctorConnection = message.connection
 		m.doctorConnectErr = message.connectionErr
 		m.markLoaded(doctorScreen)
+	case dashboardDataMsg:
+		m.loading = false
+		m.err = message.err
+		m.pods = message.pods
+		m.doctorReport = message.report
+		m.markLoaded(dashboardScreen)
+		m.markLoaded(podScreen)
 	case portsMsg:
 		m.loading = false
 		m.err = message.err
@@ -397,6 +441,42 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 			m.status = "CronJob/" + m.selectedWorkload.Name + " is now " + cronJobStateWord(message.suspended)
 			return m, m.loadCronJobDetails()
 		}
+	case profilesMsg:
+		m.loading = false
+		m.err = message.err
+		m.profileNames = message.names
+		m.clampCursor(len(m.profileNames))
+	case profileSwitchedMsg:
+		m.loading = false
+		m.err = message.err
+		if message.err == nil {
+			m.dependencies.ProfileName = message.name
+			m.dependencies.Profile = message.profile
+			m.resetClusterData()
+			m.screen = dashboardScreen
+			m.status = "Switched to profile " + message.name
+			m.loading = true
+			return m, m.loadCurrent()
+		}
+	case profileRenamedMsg:
+		m.loading = false
+		m.err = message.err
+		m.screen = profileScreen
+		if message.err == nil {
+			if m.dependencies.ProfileName == message.oldName {
+				m.dependencies.ProfileName = message.newName
+			}
+			m.status = fmt.Sprintf("Profile %s renamed to %s", message.oldName, message.newName)
+			return m, m.loadProfiles()
+		}
+	case profileDeletedMsg:
+		m.loading = false
+		m.err = message.err
+		m.screen = profileScreen
+		if message.err == nil {
+			m.status = "Profile " + message.name + " deleted"
+			return m, m.loadProfiles()
+		}
 	case tea.KeyMsg:
 		return m.handleKey(message)
 	}
@@ -404,6 +484,46 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.screen == profileRenameScreen {
+		switch key.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc":
+			m.screen = profileScreen
+			m.profileInput = ""
+			return m, nil
+		case "backspace":
+			if len(m.profileInput) > 0 {
+				m.profileInput = m.profileInput[:len(m.profileInput)-1]
+			}
+			return m, nil
+		case "enter":
+			if strings.TrimSpace(m.profileInput) == "" {
+				return m, nil
+			}
+			m.loading = true
+			return m, m.renameProfile(m.selectedProfile, strings.TrimSpace(m.profileInput))
+		default:
+			if key.Type == tea.KeyRunes {
+				m.profileInput += string(key.Runes)
+			}
+			return m, nil
+		}
+	}
+	if m.screen == profileDeleteConfirmScreen {
+		switch key.String() {
+		case "ctrl+c":
+			return m, tea.Quit
+		case "esc", "n":
+			m.screen = profileScreen
+			return m, nil
+		case "y":
+			m.loading = true
+			return m, m.deleteProfile(m.selectedProfile)
+		default:
+			return m, nil
+		}
+	}
 	if (m.screen == podActionConfirmScreen || m.screen == workloadRestartConfirmScreen ||
 		m.screen == cronJobStateConfirmScreen) &&
 		m.dependencies.Profile.Production {
@@ -457,6 +577,9 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.isNestedScreen() {
 			if m.screen == workloadRestartConfirmScreen {
 				m.screen = workloadScreen
+			} else if m.screen == profileScreen || m.screen == profileRenameScreen ||
+				m.screen == profileDeleteConfirmScreen {
+				m.screen = dashboardScreen
 			} else if m.screen == networkDetailsScreen {
 				m.screen = networkScreen
 			} else if m.screen == workloadDetailsScreen || m.screen == cronJobDetailsScreen ||
@@ -490,6 +613,15 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.changeScreen(eventScreen)
 	case "7":
 		return m.changeScreen(doctorScreen)
+	case "P":
+		if !m.isNestedScreen() {
+			m.screen = profileScreen
+			m.cursor = 0
+			m.loading = true
+			m.status = ""
+			m.err = nil
+			return m, m.loadProfiles()
+		}
 	case "tab", "right":
 		if !m.isNestedScreen() {
 			return m.changeScreen((m.screen + 1) % 7)
@@ -518,12 +650,6 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		if m.cursor < m.itemCount()-1 {
 			m.cursor++
 		}
-	case "r":
-		delete(m.loadedAt, m.screen)
-		m.loading = true
-		m.status = ""
-		m.err = nil
-		return m, m.loadCurrent()
 	case "l":
 		if (m.screen == podScreen && len(m.pods) > 0) ||
 			(m.screen == workloadPodsScreen && len(m.workloadPods) > 0) ||
@@ -572,9 +698,31 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, m.loadContainers()
 		}
 	case "d":
+		if m.screen == profileScreen && len(m.profileNames) > 0 {
+			m.selectedProfile = m.profileNames[m.cursor]
+			if m.selectedProfile == m.dependencies.ProfileName {
+				m.status = "Switch away from the active profile before deleting it"
+				return m, nil
+			}
+			m.screen = profileDeleteConfirmScreen
+			return m, nil
+		}
 		if (m.screen == podScreen && len(m.pods) > 0) || m.screen == podDetailsScreen {
 			return m.beginPodAction("delete")
 		}
+	case "r":
+		if m.screen == profileScreen && len(m.profileNames) > 0 {
+			m.selectedProfile = m.profileNames[m.cursor]
+			m.profileInput = ""
+			m.screen = profileRenameScreen
+			m.loading = false
+			return m, nil
+		}
+		delete(m.loadedAt, m.screen)
+		m.loading = true
+		m.status = ""
+		m.err = nil
+		return m, m.loadCurrent()
 	case "R":
 		if (m.screen == workloadScreen && len(m.workloads) > 0) || m.screen == workloadDetailsScreen {
 			if m.screen == workloadScreen {
@@ -620,6 +768,16 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m.executeCronJobState()
 		}
 	case "enter":
+		if m.screen == profileScreen && len(m.profileNames) > 0 {
+			name := m.profileNames[m.cursor]
+			if name == m.dependencies.ProfileName {
+				m.status = "Profile " + name + " is already active"
+				return m, nil
+			}
+			m.loading = true
+			m.status = "Connecting profile " + name
+			return m, m.switchProfile(name)
+		}
 		if m.screen == namespaceScreen && len(m.namespaces) > 0 {
 			m.loading = true
 			return m, m.switchNamespace(m.namespaces[m.cursor])
@@ -789,6 +947,12 @@ func (m Model) View() string {
 			view.WriteString(m.scrollView(m.cronJobDetailsView()))
 		case cronJobStateConfirmScreen:
 			view.WriteString(m.cronJobStateConfirmView())
+		case profileScreen:
+			view.WriteString(m.profileView())
+		case profileRenameScreen:
+			view.WriteString(m.profileRenameView())
+		case profileDeleteConfirmScreen:
+			view.WriteString(m.profileDeleteConfirmView())
 		}
 	}
 	if m.status != "" {
@@ -797,7 +961,7 @@ func (m Model) View() string {
 		view.WriteString("\n")
 	}
 	view.WriteString("\n")
-	view.WriteString(mutedStyle.Render(m.helpView()))
+	view.WriteString(mutedStyle.Render(m.responsiveHelpView()))
 	return view.String()
 }
 
@@ -879,6 +1043,15 @@ func (m Model) helpView() string {
 		if m.screen == podDetailsScreen {
 			return "l logs | p port-forward | e exec | d delete | R restart | r refresh | esc back | q quit"
 		}
+		if m.screen == profileScreen {
+			return "enter switch | r rename | d delete | up/down navigate | esc back | q quit"
+		}
+		if m.screen == profileRenameScreen {
+			return "type new profile name | enter rename | esc cancel | ctrl+c quit"
+		}
+		if m.screen == profileDeleteConfirmScreen {
+			return "y confirm delete | n/esc cancel | ctrl+c quit"
+		}
 		return "r refresh | esc back | q quit"
 	}
 	if m.screen == podScreen {
@@ -893,7 +1066,87 @@ func (m Model) helpView() string {
 	if m.screen == networkScreen {
 		return "enter details | up/down navigate | r refresh | tab/left/right screens | q quit"
 	}
-	return "1 dashboard | 2 namespaces | 3 pods | 4 workloads | 5 network | 6 events | 7 doctor | tab/left/right screens | r refresh | q quit"
+	return "1 dashboard | 2 namespaces | 3 pods | 4 workloads | 5 network | 6 events | 7 doctor | P profiles | tab/left/right screens | r refresh | q quit"
+}
+
+func (m Model) responsiveHelpView() string {
+	help := m.helpView()
+	width := m.width
+	if width <= 0 {
+		return help
+	}
+	if width < 100 {
+		replacements := []struct {
+			old string
+			new string
+		}{
+			{"up/down navigate", "up/down"},
+			{"tab/left/right screens", "tab screens"},
+			{"enter inspect affected object", "enter inspect"},
+			{"enter start port-forward", "enter start"},
+			{"type exact pod name", "type pod name"},
+			{"type exact Kind/name", "type Kind/name"},
+			{"type exact CronJob/name", "type CronJob/name"},
+		}
+		for _, replacement := range replacements {
+			help = strings.ReplaceAll(help, replacement.old, replacement.new)
+		}
+	}
+	return wrapHelp(help, width)
+}
+
+func wrapHelp(help string, width int) string {
+	if width <= 0 || lipgloss.Width(help) <= width {
+		return help
+	}
+	segments := strings.Split(help, " | ")
+	var lines []string
+	current := ""
+	for _, segment := range segments {
+		next := segment
+		if current != "" {
+			next = current + " | " + segment
+		}
+		if current != "" && lipgloss.Width(next) > width {
+			lines = append(lines, current)
+			current = segment
+			continue
+		}
+		current = next
+	}
+	if current != "" {
+		lines = append(lines, current)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func (m Model) profileView() string {
+	var view strings.Builder
+	fmt.Fprintln(&view, "Profiles")
+	fmt.Fprintln(&view)
+	for index, name := range m.profileNames {
+		cursor := "  "
+		if index == m.cursor {
+			cursor = "> "
+		}
+		active := ""
+		if name == m.dependencies.ProfileName {
+			active = " (active)"
+		}
+		fmt.Fprintf(&view, "%s%s%s\n", cursor, name, active)
+	}
+	return view.String()
+}
+
+func (m Model) profileRenameView() string {
+	return fmt.Sprintf("Rename profile %s\n\nNew name: %s", m.selectedProfile, m.profileInput)
+}
+
+func (m Model) profileDeleteConfirmView() string {
+	return fmt.Sprintf(
+		"Delete profile %s?\n\nThis removes only Kubewisp's saved profile. It does not delete the GKE cluster.",
+		m.selectedProfile,
+	)
 }
 
 func (m Model) dashboardView() string {
@@ -902,17 +1155,67 @@ func (m Model) dashboardView() string {
 		status = "unknown"
 	}
 	healthy, completed, warnings, unhealthy := podHealthCounts(m.pods)
-	return fmt.Sprintf(
-		"Connection: %s\nKubernetes: %s\nNamespace: %s\n\nPod Status: %s  %s  %s  %s\nTotal Pods: %d\n\nUse tabs or number keys to inspect namespaces and pods.",
-		status,
-		valueOrDash(m.connectivity.ServerVersion),
-		selectedNamespace(m.dependencies.Profile),
+	profile := m.dependencies.Profile
+	clusterCard := dashboardCard("Cluster", []string{
+		"Connection: " + status,
+		"Kubernetes: " + valueOrDash(m.connectivity.ServerVersion),
+		"Project: " + valueOrDash(profile.ProjectID),
+		"Cluster: " + valueOrDash(profile.ClusterName),
+		"Location: " + locationLabel(profile),
+		"Namespace: " + selectedNamespace(profile),
+	})
+	podCard := dashboardCard("Pod Health", []string{
 		healthyStyle.Render(fmt.Sprintf("● healthy %d", healthy)),
 		mutedStyle.Render(fmt.Sprintf("● completed %d", completed)),
 		warningStyle.Render(fmt.Sprintf("● warning %d", warnings)),
 		errorStyle.Render(fmt.Sprintf("● unhealthy %d", unhealthy)),
-		len(m.pods),
-	)
+		fmt.Sprintf("Total: %d", len(m.pods)),
+	})
+	dependencyCard := dashboardCard("Local Dependencies", dependencyStatusLines(m.doctorReport))
+	if m.width >= 105 {
+		return lipgloss.JoinHorizontal(lipgloss.Top, clusterCard, " ", podCard, " ", dependencyCard)
+	}
+	return lipgloss.JoinVertical(lipgloss.Left, clusterCard, podCard, dependencyCard)
+}
+
+func dashboardCard(title string, lines []string) string {
+	content := titleStyle.Render(title) + "\n\n" + strings.Join(lines, "\n")
+	return lipgloss.NewStyle().
+		Border(lipgloss.RoundedBorder()).
+		BorderForeground(lipgloss.Color("240")).
+		Padding(0, 1).
+		Width(30).
+		Render(content)
+}
+
+func dependencyStatusLines(report doctor.Report) []string {
+	if len(report.Checks) == 0 {
+		return []string{mutedStyle.Render("Checking...")}
+	}
+	lines := make([]string, 0, len(report.Checks)+1)
+	for _, check := range report.Checks {
+		if check.Passed() {
+			lines = append(lines, healthyStyle.Render("● pass")+" "+check.Dependency.Name)
+			continue
+		}
+		lines = append(lines, errorStyle.Render("● fail")+" "+check.Dependency.Name)
+	}
+	if report.Healthy() {
+		lines = append(lines, "", healthyStyle.Render("All available"))
+	} else {
+		lines = append(lines, "", warningStyle.Render("Open Doctor for guidance"))
+	}
+	return lines
+}
+
+func locationLabel(profile config.Profile) string {
+	if profile.Location == "" {
+		return "-"
+	}
+	if profile.LocationType == "" {
+		return profile.Location
+	}
+	return fmt.Sprintf("%s (%s)", profile.Location, profile.LocationType)
 }
 
 func (m Model) namespaceView() string {
@@ -1527,12 +1830,30 @@ func (m Model) loadCurrent() tea.Cmd {
 		return m.loadCronJobDetails()
 	case cronJobStateConfirmScreen:
 		return nil
+	case profileScreen:
+		return m.loadProfiles()
+	case profileRenameScreen:
+		return nil
+	case profileDeleteConfirmScreen:
+		return nil
 	case portForwardScreen:
 		return m.loadPorts()
 	case podLogsScreen:
 		return m.loadLogs(m.selectedContainer)
 	default:
 		return nil
+	}
+}
+
+func (m Model) loadDashboardData() tea.Cmd {
+	namespace := selectedNamespace(m.dependencies.Profile)
+	return func() tea.Msg {
+		report := doctor.Report{}
+		if m.dependencies.Doctor != nil {
+			report = m.dependencies.Doctor.Run(context.Background())
+		}
+		pods, err := m.dependencies.Pods.List(context.Background(), namespace)
+		return dashboardDataMsg{pods: pods, report: report, err: err}
 	}
 }
 
@@ -1622,6 +1943,88 @@ func (m Model) loadEvents() tea.Cmd {
 		}
 		events, err := m.dependencies.Events.ListWarnings(context.Background(), namespace)
 		return eventsMsg{events: events, err: err}
+	}
+}
+
+func (m Model) loadProfiles() tea.Cmd {
+	return func() tea.Msg {
+		cfg, err := (config.Store{Path: m.dependencies.ConfigPath}).Load()
+		if err != nil {
+			return profilesMsg{err: err}
+		}
+		names := make([]string, 0, len(cfg.Profiles))
+		for name := range cfg.Profiles {
+			names = append(names, name)
+		}
+		sort.Strings(names)
+		return profilesMsg{names: names}
+	}
+}
+
+func (m Model) switchProfile(name string) tea.Cmd {
+	return func() tea.Msg {
+		cfg, err := (config.Store{Path: m.dependencies.ConfigPath}).Load()
+		if err != nil {
+			return profileSwitchedMsg{name: name, err: err}
+		}
+		profile, exists := cfg.Profiles[name]
+		if !exists {
+			return profileSwitchedMsg{name: name, err: fmt.Errorf("profile %q does not exist", name)}
+		}
+		if m.dependencies.Profiles == nil {
+			return profileSwitchedMsg{name: name, err: errors.New("profile connector is not configured")}
+		}
+		if err := m.dependencies.Profiles.Connect(context.Background(), profile); err != nil {
+			return profileSwitchedMsg{name: name, err: err}
+		}
+		cfg.CurrentProfile = name
+		if err := (config.Store{Path: m.dependencies.ConfigPath}).Save(cfg); err != nil {
+			return profileSwitchedMsg{name: name, err: err}
+		}
+		return profileSwitchedMsg{name: name, profile: profile}
+	}
+}
+
+func (m Model) renameProfile(oldName, newName string) tea.Cmd {
+	return func() tea.Msg {
+		store := config.Store{Path: m.dependencies.ConfigPath}
+		cfg, err := store.Load()
+		if err != nil {
+			return profileRenamedMsg{oldName: oldName, newName: newName, err: err}
+		}
+		profile, exists := cfg.Profiles[oldName]
+		if !exists {
+			return profileRenamedMsg{oldName: oldName, newName: newName, err: fmt.Errorf("profile %q does not exist", oldName)}
+		}
+		if _, exists := cfg.Profiles[newName]; exists {
+			return profileRenamedMsg{oldName: oldName, newName: newName, err: fmt.Errorf("profile %q already exists", newName)}
+		}
+		delete(cfg.Profiles, oldName)
+		cfg.Profiles[newName] = profile
+		if cfg.CurrentProfile == oldName {
+			cfg.CurrentProfile = newName
+		}
+		err = store.Save(cfg)
+		return profileRenamedMsg{oldName: oldName, newName: newName, err: err}
+	}
+}
+
+func (m Model) deleteProfile(name string) tea.Cmd {
+	return func() tea.Msg {
+		store := config.Store{Path: m.dependencies.ConfigPath}
+		cfg, err := store.Load()
+		if err != nil {
+			return profileDeletedMsg{name: name, err: err}
+		}
+		if name == cfg.CurrentProfile {
+			return profileDeletedMsg{name: name, err: errors.New("switch away from the active profile before deleting it")}
+		}
+		if _, exists := cfg.Profiles[name]; !exists {
+			return profileDeletedMsg{name: name, err: fmt.Errorf("profile %q does not exist", name)}
+		}
+		delete(cfg.Profiles, name)
+		err = store.Save(cfg)
+		return profileDeletedMsg{name: name, err: err}
 	}
 }
 
@@ -1722,6 +2125,8 @@ func (m Model) itemCount() int {
 		return len(m.networkResources)
 	case eventScreen:
 		return len(m.events)
+	case profileScreen:
+		return len(m.profileNames)
 	case containerScreen:
 		return len(m.containers)
 	case execContainerScreen:
@@ -1740,7 +2145,8 @@ func (m Model) isNestedScreen() bool {
 		m.screen == podActionConfirmScreen || m.screen == workloadRestartConfirmScreen ||
 		m.screen == workloadDetailsScreen || m.screen == workloadPodsScreen || m.screen == networkDetailsScreen ||
 		m.screen == cronJobDetailsScreen ||
-		m.screen == cronJobStateConfirmScreen
+		m.screen == cronJobStateConfirmScreen || m.screen == profileScreen ||
+		m.screen == profileRenameScreen || m.screen == profileDeleteConfirmScreen
 }
 
 func (m *Model) markLoaded(value screen) {
@@ -1752,6 +2158,24 @@ func (m *Model) markLoaded(value screen) {
 func (m Model) cacheFresh(value screen) bool {
 	loaded, ok := m.loadedAt[value]
 	return ok && m.now().Sub(loaded) < m.cacheTTL
+}
+
+func (m *Model) resetClusterData() {
+	m.connectivity = kube.ConnectivityReport{}
+	m.namespaces = nil
+	m.pods = nil
+	m.podDetails = kube.PodDetails{}
+	m.logs = ""
+	m.containers = nil
+	m.workloads = nil
+	m.workloadPods = nil
+	m.networkResources = nil
+	m.networkDetails = kube.NetworkDetails{}
+	m.events = nil
+	m.loadedAt = make(map[screen]time.Time)
+	m.cursor = 0
+	m.scroll = 0
+	m.err = nil
 }
 
 func cronJobStateAction(suspended bool) string {

@@ -35,6 +35,14 @@ func IsReauthenticationError(err error) bool {
 	return false
 }
 
+func ClusterFromProfile(profile config.Profile) Cluster {
+	return Cluster{
+		Name:         profile.ClusterName,
+		Location:     profile.Location,
+		LocationType: profile.LocationType,
+	}
+}
+
 type Cluster struct {
 	Name         string `json:"name"`
 	Location     string `json:"location"`
@@ -64,8 +72,8 @@ func (c *Client) ActiveAccount(ctx context.Context) (string, error) {
 	return strings.TrimSpace(result.Stdout), nil
 }
 
-func (c *Client) Login(ctx context.Context, stdin io.Reader, stdout, stderr io.Writer) error {
-	if err := c.runner.RunInteractive(ctx, stdin, stdout, stderr, "gcloud", "auth", "login"); err != nil {
+func (c *Client) Login(ctx context.Context, _ io.Reader, stdout, stderr io.Writer) error {
+	if err := c.runner.RunInteractive(ctx, nil, stdout, stderr, "gcloud", "auth", "login", "--quiet"); err != nil {
 		return fmt.Errorf("run gcloud auth login: %w", err)
 	}
 	return nil

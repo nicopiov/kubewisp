@@ -100,3 +100,39 @@ func TestProfileShowCurrent(t *testing.T) {
 		t.Fatalf("unexpected output:\n%s", output.String())
 	}
 }
+
+func TestProfileRenameUpdatesCurrentProfile(t *testing.T) {
+	t.Parallel()
+
+	path := writeProfileTestConfig(t)
+	command := NewRootCommand(Dependencies{Runner: fakeRunner{}})
+	command.SetArgs([]string{"--config", path, "profile", "rename", "staging", "development"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	cfg, err := (config.Store{Path: path}).Load()
+	if err != nil || cfg.CurrentProfile != "development" || cfg.Profiles["development"].ClusterName != "staging-main" {
+		t.Fatalf("renamed config = %#v, error = %v", cfg, err)
+	}
+}
+
+func TestProfileDeleteRequiresConfirmationAndSelectsNext(t *testing.T) {
+	t.Parallel()
+
+	path := writeProfileTestConfig(t)
+	command := NewRootCommand(Dependencies{Runner: fakeRunner{}})
+	command.SetIn(strings.NewReader("y\n"))
+	command.SetArgs([]string{"--config", path, "profile", "delete", "staging"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	cfg, err := (config.Store{Path: path}).Load()
+	if err != nil || cfg.CurrentProfile != "production" {
+		t.Fatalf("deleted config = %#v, error = %v", cfg, err)
+	}
+	if _, exists := cfg.Profiles["staging"]; exists {
+		t.Fatal("deleted profile still exists")
+	}
+}

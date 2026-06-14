@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/nicopiov/kubewisp/internal/runner"
@@ -16,8 +17,10 @@ type call struct {
 }
 
 type fakeRunner struct {
-	results []runner.CommandResult
-	calls   []call
+	results          []runner.CommandResult
+	calls            []call
+	interactiveCalls []call
+	interactiveInput io.Reader
 }
 
 func (f *fakeRunner) LookPath(string) (string, error) {
@@ -31,8 +34,26 @@ func (f *fakeRunner) Run(_ context.Context, name string, args ...string) runner.
 	return result
 }
 
-func (f *fakeRunner) RunInteractive(context.Context, io.Reader, io.Writer, io.Writer, string, ...string) error {
-	return errors.New("not used")
+func (f *fakeRunner) RunInteractive(_ context.Context, input io.Reader, _ io.Writer, _ io.Writer, name string, args ...string) error {
+	f.interactiveCalls = append(f.interactiveCalls, call{name: name, args: args})
+	f.interactiveInput = input
+	return nil
+}
+
+func TestLoginUsesBrowserOAuthWithoutTerminalPrompts(t *testing.T) {
+	t.Parallel()
+
+	commandRunner := &fakeRunner{}
+	if err := NewClient(commandRunner).Login(context.Background(), strings.NewReader("unused"), io.Discard, io.Discard); err != nil {
+		t.Fatalf("Login() error = %v", err)
+	}
+	if commandRunner.interactiveInput != nil {
+		t.Fatal("Login() passed terminal input to gcloud")
+	}
+	want := []string{"auth", "login", "--quiet"}
+	if !reflect.DeepEqual(commandRunner.interactiveCalls[0].args, want) {
+		t.Fatalf("login args = %#v, want %#v", commandRunner.interactiveCalls[0].args, want)
+	}
 }
 
 func TestListClustersDetectsRegionalAndZonalLocations(t *testing.T) {

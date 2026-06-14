@@ -7,6 +7,7 @@ import (
 
 	"github.com/nicopiov/kubewisp/internal/cli"
 	"github.com/nicopiov/kubewisp/internal/doctor"
+	"github.com/nicopiov/kubewisp/internal/gcloud"
 	"github.com/nicopiov/kubewisp/internal/kube"
 	"github.com/nicopiov/kubewisp/internal/kubectl"
 	"github.com/nicopiov/kubewisp/internal/runner"
@@ -23,6 +24,7 @@ func main() {
 	events := kube.NewEventServiceWithFactory(clientFactory)
 	network := kube.NewNetworkServiceWithFactory(clientFactory)
 	commandRunner := runner.NewOSRunner()
+	profileConnector := gcloud.NewProfileConnector(gcloud.NewClient(commandRunner), connectivity, clientFactory)
 	doctorReporter := doctor.NewService(commandRunner)
 	kubectlService := kubectl.NewService(commandRunner)
 	command := cli.NewRootCommand(cli.Dependencies{
@@ -35,7 +37,7 @@ func main() {
 		PortForward:  kubectlService,
 		Exec:         kubectlService,
 		Selector:     selector.NewTerminal(),
-		TUI:          tui.NewRunner(connectivity, namespaces, pods, workloads, network, events, doctorReporter, kubectlService, kubectlService),
+		TUI:          tui.NewRunner(connectivity, namespaces, pods, workloads, network, events, doctorReporter, kubectlService, kubectlService, profileConnector),
 		Version:      buildVersion(),
 	})
 

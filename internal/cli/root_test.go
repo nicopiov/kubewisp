@@ -78,3 +78,24 @@ func TestDoctorCommandMissingDependency(t *testing.T) {
 		t.Fatalf("unexpected output:\n%s", output.String())
 	}
 }
+
+func TestRootHelpGroupsCommandsAndShowsExamples(t *testing.T) {
+	t.Parallel()
+
+	command := NewRootCommand(Dependencies{Runner: fakeRunner{}})
+	var output bytes.Buffer
+	command.SetOut(&output)
+	command.SetArgs([]string{"--help"})
+
+	if err := command.Execute(); err != nil {
+		t.Fatalf("Execute() error = %v", err)
+	}
+	for _, expected := range []string{
+		"Start and setup:", "Inspect and operate:", "Manage Kubewisp:",
+		"kubewisp profile add", "kubewisp workloads restart Deployment/api",
+	} {
+		if !strings.Contains(output.String(), expected) {
+			t.Fatalf("help missing %q:\n%s", expected, output.String())
+		}
+	}
+}

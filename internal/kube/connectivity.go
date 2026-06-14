@@ -26,7 +26,7 @@ type ClientFactory interface {
 }
 
 type KubeconfigClientFactory struct {
-	once   sync.Once
+	mutex  sync.Mutex
 	client kubernetes.Interface
 	err    error
 }
@@ -36,7 +36,9 @@ func NewKubeconfigClientFactory() *KubeconfigClientFactory {
 }
 
 func (f *KubeconfigClientFactory) Client() (kubernetes.Interface, error) {
-	f.once.Do(func() {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	if f.client == nil && f.err == nil {
 		rules := clientcmd.NewDefaultClientConfigLoadingRules()
 		clientConfig := clientcmd.NewNonInteractiveDeferredLoadingClientConfig(
 			rules,
@@ -45,14 +47,21 @@ func (f *KubeconfigClientFactory) Client() (kubernetes.Interface, error) {
 		restConfig, err := clientConfig.ClientConfig()
 		if err != nil {
 			f.err = fmt.Errorf("load kubeconfig: %w", err)
-			return
+			return nil, f.err
 		}
 		f.client, f.err = kubernetes.NewForConfig(restConfig)
 		if f.err != nil {
 			f.err = fmt.Errorf("create Kubernetes client: %w", f.err)
 		}
-	})
+	}
 	return f.client, f.err
+}
+
+func (f *KubeconfigClientFactory) Reset() {
+	f.mutex.Lock()
+	defer f.mutex.Unlock()
+	f.client = nil
+	f.err = nil
 }
 
 type Checker struct {
@@ -101,6 +110,12 @@ func diagnose(action string, err error) error {
 	message := strings.ToLower(err.Error())
 
 	switch {
+	case isGcloudReauthenticationMessage(message):
+		return fmt.Errorf(
+			"%s: Google Cloud authentication expired; run `gcloud auth login` or restart Kubewisp to reauthenticate: %w",
+			action,
+			err,
+		)
 	case strings.Contains(message, "gke-gcloud-auth-plugin not found"),
 		strings.Contains(message, "executable gke-gcloud-auth-plugin"):
 		return fmt.Errorf(
@@ -120,4 +135,21 @@ func diagnose(action string, err error) error {
 	default:
 		return fmt.Errorf("%s: %w", action, err)
 	}
+}
+
+func isGcloudReauthenticationMessage(message string) bool {
+	for _, hint := range []string{
+		"reauthentication failed",
+		"problem refreshing your current auth token",
+		"problem refreshing your current auth tokens",
+		"cannot prompt during non-interactive execution",
+		"invalid_grant",
+		"credentials have been revoked",
+		"gcloud auth login",
+	} {
+		if strings.Contains(message, hint) {
+			return true
+		}
+	}
+	return false
 }

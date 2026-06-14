@@ -37,12 +37,25 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 	configPath := defaultConfigPath
 
 	command := &cobra.Command{
-		Use:           "kubewisp",
-		Short:         "Safely navigate and operate GKE clusters",
+		Use:   "kubewisp",
+		Short: "Safely navigate and operate GKE clusters",
+		Long: `Kubewisp is a keyboard-driven CLI and TUI for navigating GKE clusters,
+inspecting workloads, troubleshooting pods, and performing guarded operations.
+
+Run kubewisp without a subcommand to select a profile, refresh GKE credentials,
+verify connectivity, and open the interactive dashboard.`,
+		Example: `  kubewisp
+  kubewisp init
+  kubewisp profile add
+  kubewisp pods describe
+  kubewisp workloads restart Deployment/api`,
 		SilenceErrors: true,
 		SilenceUsage:  true,
-		Args:          cobra.NoArgs,
-		RunE:          runTUICommand(dependencies, &configPath),
+		CompletionOptions: cobra.CompletionOptions{
+			DisableDefaultCmd: true,
+		},
+		Args: cobra.NoArgs,
+		RunE: runTUICommand(dependencies, &configPath),
 		PersistentPreRunE: func(_ *cobra.Command, _ []string) error {
 			if configPath == "" {
 				return fmt.Errorf("determine config path: %w", err)
@@ -57,16 +70,26 @@ func NewRootCommand(dependencies Dependencies) *cobra.Command {
 		"config file path (default $KUBEWISP_CONFIG or ~/.config/kubewisp/config.yaml)",
 	)
 
-	command.AddCommand(newDoctorCommand(dependencies))
-	command.AddCommand(newInitCommand(dependencies, &configPath))
-	command.AddCommand(newClusterCommand(dependencies, &configPath))
-	command.AddCommand(newNamespaceCommand(dependencies, &configPath))
-	command.AddCommand(newPodsCommand(dependencies, &configPath))
-	command.AddCommand(newWorkloadsCommand(dependencies, &configPath))
-	command.AddCommand(newEventsCommand(dependencies, &configPath))
-	command.AddCommand(newProfileCommand(&configPath))
-	command.AddCommand(newTUICommand(dependencies, &configPath))
-	command.AddCommand(newVersionCommand(dependencies.Version))
+	command.AddGroup(
+		&cobra.Group{ID: "start", Title: "Start and setup:"},
+		&cobra.Group{ID: "inspect", Title: "Inspect and operate:"},
+		&cobra.Group{ID: "manage", Title: "Manage Kubewisp:"},
+	)
+	addGroupedCommand(command, "start", newInitCommand(dependencies, &configPath))
+	addGroupedCommand(command, "start", newTUICommand(dependencies, &configPath))
+	addGroupedCommand(command, "inspect", newClusterCommand(dependencies, &configPath))
+	addGroupedCommand(command, "inspect", newNamespaceCommand(dependencies, &configPath))
+	addGroupedCommand(command, "inspect", newPodsCommand(dependencies, &configPath))
+	addGroupedCommand(command, "inspect", newWorkloadsCommand(dependencies, &configPath))
+	addGroupedCommand(command, "inspect", newEventsCommand(dependencies, &configPath))
+	addGroupedCommand(command, "manage", newProfileCommand(dependencies, &configPath))
+	addGroupedCommand(command, "manage", newDoctorCommand(dependencies))
+	addGroupedCommand(command, "manage", newVersionCommand(dependencies.Version))
 
 	return command
+}
+
+func addGroupedCommand(parent *cobra.Command, group string, child *cobra.Command) {
+	child.GroupID = group
+	parent.AddCommand(child)
 }
