@@ -5,6 +5,7 @@ import (
 	"errors"
 	"io"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -46,7 +47,8 @@ type fakeWorkloads struct {
 }
 
 type fakeEvents struct {
-	items []kube.NamespaceEventSummary
+	items       []kube.NamespaceEventSummary
+	diagnostics kube.ResourceDiagnostics
 }
 
 type fakeNetwork struct {
@@ -74,6 +76,10 @@ func (f fakeNetwork) ServicesForIngress(context.Context, string, string) ([]kube
 
 func (f fakeEvents) ListWarnings(context.Context, string) ([]kube.NamespaceEventSummary, error) {
 	return f.items, nil
+}
+
+func (f fakeEvents) Diagnose(context.Context, string, string, string) (kube.ResourceDiagnostics, error) {
+	return f.diagnostics, nil
 }
 
 func (f fakeWorkloads) List(context.Context, string) ([]kube.WorkloadSummary, error) {
@@ -673,6 +679,7 @@ func TestDashboardLoadsConnectivity(t *testing.T) {
 		"Location: europe-west1",
 		"Local Dependencies",
 		"pass gcloud",
+		"/usr/local/bin/gcloud",
 		"healthy 1",
 		"unhealthy 1",
 	} {
@@ -719,6 +726,232 @@ func TestContextHelpCompactsAndWrapsAtTerminalWidth(t *testing.T) {
 	for _, line := range strings.Split(help, "\n") {
 		if lipgloss.Width(line) > model.width {
 			t.Fatalf("help line width = %d, want <= %d: %q", lipgloss.Width(line), model.width, line)
+		}
+	}
+}
+
+func TestContextHelpGroupsNavigationActionsAndGeneralCommands(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = podDetailsScreen
+	model.loading = false
+
+	view := model.helpView()
+	for _, expected := range []string{
+		"Navigate:", "up/down scroll",
+		"Actions:", "v diagnostics", "o owner",
+		"General:", "esc back", "q quit",
+	} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("grouped help missing %q:\n%s", expected, view)
+		}
+	}
+}
+
+func TestContextHelpHighlightsKeysAndSticksToTerminalBottom(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = podScreen
+	model.loading = false
+	model.width = 100
+	model.height = 24
+	model.pods = []kube.PodSummary{{Name: "api", Ready: "1/1", Status: "Running"}}
+
+	help := model.responsiveHelpView()
+	if !helpKeyStyle.GetBold() || !helpGroupStyle.GetBold() ||
+		!strings.Contains(help, "Navigate:") || !strings.Contains(help, "enter details") {
+		t.Fatalf("help styles or content are not configured:\n%s", help)
+	}
+	if got := lipgloss.Height(model.View()); got != model.height {
+		t.Fatalf("view height = %d, want terminal height %d:\n%s", got, model.height, model.View())
+	}
+}
+
+func TestContextHelpHighlightsFirstActionAndGeneralCommand(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = podScreen
+	model.loading = false
+
+	help := model.responsiveHelpView()
+	for _, line := range strings.Split(help, "\n") {
+		if strings.HasPrefix(line, "Actions:") || strings.HasPrefix(line, "General:") {
+			if strings.Contains(line, ":  ") {
+				t.Fatalf("first command retains an unstyled leading blank: %q", line)
+			}
+		}
+	}
+}
+
+func TestContentWrapsToTerminalWidthAndRemainsScrollable(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = resourceDiagnosticsScreen
+	model.loading = false
+	model.width = 36
+	model.height = 12
+	model.diagnostics = kube.ResourceDiagnostics{
+		ResourceKind: "Pod",
+		ResourceName: "api",
+		Summary:      "This diagnostic summary contains important information that must remain visible on narrow terminals.",
+		Causes:       []string{"A very long possible cause should wrap instead of disappearing beyond the terminal edge."},
+	}
+
+	view := model.View()
+	for _, line := range strings.Split(view, "\n") {
+		if lipgloss.Width(line) > model.width {
+			t.Fatalf("wrapped line width = %d, want <= %d: %q", lipgloss.Width(line), model.width, line)
+		}
+	}
+	if !strings.Contains(view, "lines 1-") {
+		t.Fatalf("wrapped content is not vertically scrollable:\n%s", view)
+	}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	if !strings.Contains(updated.(Model).View(), "lines 2-") {
+		t.Fatalf("scrolling did not advance through wrapped content:\n%s", updated.(Model).View())
+	}
+}
+
+func TestResourceTablesAlignColumnsWithColoredAndVariableWidthValues(t *testing.T) {
+	t.Parallel()
+
+	view := podListView([]kube.PodSummary{
+		{Name: "api", Ready: "1/1", Status: "Running", Restarts: 1},
+		{Name: "long-worker-name", Ready: "0/2", Status: "CrashLoopBackOff", Restarts: 12, WarningCount: 3},
+	}, 0)
+	lines := strings.Split(strings.TrimRight(view, "\n"), "\n")
+	if len(lines) != 3 {
+		t.Fatalf("table lines = %d, want 3:\n%s", len(lines), view)
+	}
+	wantSeparators := tableSeparatorPositions(lines[0])
+	for _, line := range lines[1:] {
+		if got := tableSeparatorPositions(line); !slices.Equal(got, wantSeparators) {
+			t.Fatalf("separator positions = %v, want %v:\n%s", got, wantSeparators, view)
+		}
+	}
+}
+
+func tableSeparatorPositions(line string) []int {
+	var positions []int
+	offset := 0
+	for {
+		index := strings.Index(line[offset:], "|")
+		if index < 0 {
+			return positions
+		}
+		index += offset
+		positions = append(positions, lipgloss.Width(line[:index]))
+		offset = index + 1
+	}
+}
+
+func TestDashboardAndProfileHelpAvoidDuplicateOrConflictingCommands(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.loading = false
+
+	dashboardHelp := model.helpView()
+	if strings.Contains(dashboardHelp, "Navigate:") ||
+		strings.Count(dashboardHelp, "1-6 screens") != 1 ||
+		!strings.Contains(dashboardHelp, "tab/left/right switch") {
+		t.Fatalf("dashboard help is inconsistent:\n%s", dashboardHelp)
+	}
+
+	model.screen = profileScreen
+	model.profileNames = []string{"staging"}
+	profileHelp := model.helpView()
+	for _, expected := range []string{"enter switch", "r rename", "d delete", "esc back", "q quit"} {
+		if !strings.Contains(profileHelp, expected) {
+			t.Fatalf("profile help missing %q:\n%s", expected, profileHelp)
+		}
+	}
+	if strings.Contains(profileHelp, "r refresh") {
+		t.Fatalf("profile help advertises conflicting refresh shortcut:\n%s", profileHelp)
+	}
+}
+
+func TestListHelpTreatsEnterAsNavigationAndFilterAsAction(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = podScreen
+	model.loading = false
+
+	help := model.helpView()
+	navigate, actions, _ := strings.Cut(help, "\n")
+	if !strings.Contains(navigate, "enter details") || strings.Contains(navigate, "/ filter") {
+		t.Fatalf("pod navigation group is inconsistent:\n%s", help)
+	}
+	if !strings.Contains(actions, "Actions:") || !strings.Contains(actions, "/ filter") {
+		t.Fatalf("pod actions group is inconsistent:\n%s", help)
+	}
+}
+
+func TestCtrlCCancelsTextInputAndConfirmationWithoutQuitting(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = podScreen
+	model.filtering = true
+	model.filterScreen = podScreen
+	model.filterQuery = "api"
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	filtered := updated.(Model)
+	if command != nil || filtered.filtering || filtered.filterQuery != "" {
+		t.Fatalf("Ctrl+C did not cancel filtering: %#v", filtered)
+	}
+
+	model.screen = profileRenameScreen
+	model.filtering = false
+	model.profileInput = "new-name"
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	renaming := updated.(Model)
+	if command != nil || renaming.screen != profileScreen || renaming.profileInput != "" {
+		t.Fatalf("Ctrl+C did not cancel rename: %#v", renaming)
+	}
+
+	model.screen = podActionConfirmScreen
+	model.dependencies.Profile.Production = false
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	confirming := updated.(Model)
+	if command != nil || confirming.screen != podScreen {
+		t.Fatalf("Ctrl+C did not cancel confirmation: %#v", confirming)
+	}
+
+	model.screen = workloadRestartConfirmScreen
+	model.dependencies.Profile.Production = true
+	model.confirmationInput = "Deployment/api"
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyCtrlC})
+	productionConfirm := updated.(Model)
+	if command != nil || productionConfirm.screen != workloadScreen || productionConfirm.confirmationInput != "" {
+		t.Fatalf("Ctrl+C did not cancel production confirmation: %#v", productionConfirm)
+	}
+}
+
+func TestDashboardShowsMissingDependencyGuidance(t *testing.T) {
+	t.Parallel()
+
+	dependencies := testDependencies(t)
+	dependencies.Doctor = fakeDoctor{report: doctor.Report{Checks: []doctor.Check{{
+		Dependency: doctor.Dependency{Name: "kubectl", Description: "Kubernetes command-line tool"},
+		Err:        errors.New("not found"),
+	}}}}
+	model := NewModel(dependencies)
+	message := model.Init()()
+	updated, command := model.Update(message)
+	message = command()
+	updated, _ = updated.(Model).Update(message)
+
+	view := updated.(Model).View()
+	for _, expected := range []string{"fail kubectl", "not found", "Run kubewisp doctor for", "details"} {
+		if !strings.Contains(view, expected) {
+			t.Fatalf("dashboard missing %q:\n%s", expected, view)
 		}
 	}
 }
@@ -947,32 +1180,6 @@ func TestListFilterShowsNoMatches(t *testing.T) {
 	}
 }
 
-func TestNavigateToDoctorShowsHealthyReport(t *testing.T) {
-	t.Parallel()
-
-	model := NewModel(testDependencies(t))
-	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'7'}})
-	message := command()
-	updated, _ = updated.(Model).Update(message)
-	final := updated.(Model)
-
-	if final.screen != doctorScreen {
-		t.Fatalf("screen = %d, want doctorScreen", final.screen)
-	}
-	for _, expected := range []string{
-		"[Doctor]",
-		"● pass",
-		"gcloud",
-		"/usr/local/bin/gcloud",
-		"Kubernetes API v1.32.1",
-		"namespace api",
-	} {
-		if !strings.Contains(final.View(), expected) {
-			t.Fatalf("view does not contain %q:\n%s", expected, final.View())
-		}
-	}
-}
-
 func TestNetworkScreenShowsResourcesAndOpensDetails(t *testing.T) {
 	t.Parallel()
 
@@ -1121,10 +1328,14 @@ func TestReplicaWorkloadEnterLoadsDetails(t *testing.T) {
 	for _, want := range []string{
 		"Deployment Details: api", "RollingUpdate", "app=api",
 		"app | image=example/api:v1", "MinimumReplicasAvailable",
-		"p managed pods", "R rollout restart",
 	} {
 		if !strings.Contains(final.View(), want) {
 			t.Fatalf("details missing %q:\n%s", want, final.View())
+		}
+	}
+	for _, want := range []string{"Navigate:", "Actions:", "v diagnostics", "p managed pods", "General:"} {
+		if !strings.Contains(final.helpView(), want) {
+			t.Fatalf("details help missing %q:\n%s", want, final.helpView())
 		}
 	}
 }
@@ -1328,6 +1539,72 @@ func TestPodDetailsOpenOwnerWorkload(t *testing.T) {
 	}
 }
 
+func TestPodAndWorkloadDetailsOpenDiagnostics(t *testing.T) {
+	t.Parallel()
+
+	dependencies := testDependencies(t)
+	events := dependencies.Events.(fakeEvents)
+	events.diagnostics = kube.ResourceDiagnostics{
+		ResourceKind: "Pod",
+		ResourceName: "api-abc",
+		Summary:      "Container app is repeatedly failing.",
+		Causes:       []string{"Container app previously terminated with exit code 1."},
+		Events: []kube.NamespaceEventSummary{{
+			ObjectKind: "Pod", ObjectName: "api-abc", Reason: "BackOff",
+			Message: "Back-off restarting failed container", Count: 7,
+		}},
+	}
+	dependencies.Events = events
+	model := NewModel(dependencies)
+	model.screen = podDetailsScreen
+	model.loading = false
+	model.selectedPod = "api-abc"
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	updated, _ = updated.(Model).Update(command())
+	diagnostics := updated.(Model)
+	if diagnostics.screen != resourceDiagnosticsScreen {
+		t.Fatalf("screen = %d, want resourceDiagnosticsScreen", diagnostics.screen)
+	}
+	for _, want := range []string{
+		"Diagnostics: Pod/api-abc", "Container app is repeatedly failing",
+		"exit code 1", "BackOff", "count=7",
+	} {
+		if !strings.Contains(diagnostics.View(), want) {
+			t.Fatalf("diagnostics missing %q:\n%s", want, diagnostics.View())
+		}
+	}
+	updated, _ = diagnostics.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if updated.(Model).screen != podDetailsScreen {
+		t.Fatalf("diagnostics escape screen = %d, want podDetailsScreen", updated.(Model).screen)
+	}
+
+	model.screen = workloadDetailsScreen
+	model.selectedWorkload = kube.WorkloadSummary{Kind: "Deployment", Name: "api"}
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'v'}})
+	if command == nil || updated.(Model).diagnosticBackScreen != workloadDetailsScreen {
+		t.Fatalf("workload diagnostics did not open: %#v", updated.(Model))
+	}
+}
+
+func TestPodAndWorkloadListsShowWarningCounts(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = podScreen
+	model.loading = false
+	model.pods = []kube.PodSummary{{Name: "api", Status: "Running", WarningCount: 3}}
+	if view := model.View(); !strings.Contains(view, "WARNINGS") || !strings.Contains(view, "3") {
+		t.Fatalf("pod warning count missing:\n%s", view)
+	}
+
+	model.screen = workloadScreen
+	model.workloads = []kube.WorkloadSummary{{Kind: "Deployment", Name: "api", WarningCount: 2}}
+	if view := model.View(); !strings.Contains(view, "WARNINGS") || !strings.Contains(view, "2") {
+		t.Fatalf("workload warning count missing:\n%s", view)
+	}
+}
+
 func TestWorkloadManagedPodLogsReturnToManagedPods(t *testing.T) {
 	t.Parallel()
 
@@ -1481,38 +1758,6 @@ func TestProductionWorkloadRestartRequiresExactReference(t *testing.T) {
 	updated, _ = updated.(Model).Update(command())
 	if restarted != "Deployment/api" {
 		t.Fatalf("restarted = %q", restarted)
-	}
-}
-
-func TestDoctorShowsDependencyAndConnectivityFailures(t *testing.T) {
-	t.Parallel()
-
-	dependencies := testDependencies(t)
-	dependencies.Doctor = fakeDoctor{report: doctor.Report{Checks: []doctor.Check{{
-		Dependency: doctor.Dependency{
-			Name:        "kubectl",
-			Description: "Kubernetes command-line tool",
-			InstallURL:  "https://kubernetes.io/docs/tasks/tools/",
-		},
-		Err: errors.New("not found"),
-	}}}}
-	dependencies.Connectivity = fakeConnectivity{err: errors.New("namespace forbidden")}
-
-	model := NewModel(dependencies)
-	model.screen = doctorScreen
-	message := model.Init()()
-	updated, _ := model.Update(message)
-	final := updated.(Model)
-
-	for _, expected := range []string{
-		"● fail",
-		"kubectl",
-		"https://kubernetes.io/docs/tasks/tools/",
-		"Kubernetes API and namespace: namespace forbidden",
-	} {
-		if !strings.Contains(final.View(), expected) {
-			t.Fatalf("view does not contain %q:\n%s", expected, final.View())
-		}
 	}
 }
 

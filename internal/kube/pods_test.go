@@ -40,6 +40,12 @@ func TestPodsListSummarizesAndSorts(t *testing.T) {
 				}},
 			},
 		},
+		&corev1.Event{
+			ObjectMeta:     metav1.ObjectMeta{Name: "worker-backoff", Namespace: "api"},
+			InvolvedObject: corev1.ObjectReference{Kind: "Pod", Name: "worker"},
+			Type:           corev1.EventTypeWarning,
+			Count:          4,
+		},
 		&corev1.Pod{
 			ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "api"},
 			Spec:       corev1.PodSpec{Containers: []corev1.Container{{Name: "app"}}},
@@ -64,7 +70,7 @@ func TestPodsListSummarizesAndSorts(t *testing.T) {
 	if pods[0].Ready != "1/1" || pods[0].Status != "Running" {
 		t.Fatalf("api summary = %#v", pods[0])
 	}
-	if pods[1].Status != "CrashLoopBackOff" || pods[1].Restarts != 3 {
+	if pods[1].Status != "CrashLoopBackOff" || pods[1].Restarts != 3 || pods[1].WarningCount != 4 {
 		t.Fatalf("worker summary = %#v", pods[1])
 	}
 }

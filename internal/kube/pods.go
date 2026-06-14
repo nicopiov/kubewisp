@@ -6,6 +6,7 @@ import (
 	"io"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	corev1 "k8s.io/api/core/v1"
@@ -43,6 +44,7 @@ type PodSummary struct {
 	LastRestartAt time.Time
 	OwnerKind     string
 	OwnerName     string
+	WarningCount  int32
 }
 
 type PodActionInfo struct {
@@ -128,14 +130,35 @@ func (s *Pods) List(ctx context.Context, namespace string) ([]PodSummary, error)
 		return nil, err
 	}
 
-	list, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
-	if err != nil {
-		return nil, diagnose(fmt.Sprintf("list pods in namespace %q", namespace), err)
+	var list *corev1.PodList
+	var events *corev1.EventList
+	var podErr, eventErr error
+	var wait sync.WaitGroup
+	wait.Add(2)
+	go func() {
+		defer wait.Done()
+		list, podErr = client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{})
+	}()
+	go func() {
+		defer wait.Done()
+		events, eventErr = client.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+			FieldSelector: "type=" + corev1.EventTypeWarning,
+		})
+	}()
+	wait.Wait()
+	if podErr != nil {
+		return nil, diagnose(fmt.Sprintf("list pods in namespace %q", namespace), podErr)
 	}
 
 	pods := make([]PodSummary, 0, len(list.Items))
 	for index := range list.Items {
 		pods = append(pods, summarizePod(&list.Items[index]))
+	}
+	if eventErr == nil {
+		counts := warningCountByObject(events.Items)
+		for index := range pods {
+			pods[index].WarningCount = counts["Pod\x00"+pods[index].Name]
+		}
 	}
 	sort.Slice(pods, func(i, j int) bool {
 		return pods[i].Name < pods[j].Name

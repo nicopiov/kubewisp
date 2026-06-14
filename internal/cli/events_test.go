@@ -19,6 +19,11 @@ func (f *fakeEvents) ListWarnings(_ context.Context, namespace string) ([]kube.N
 	return f.items, nil
 }
 
+func (f *fakeEvents) Diagnose(_ context.Context, namespace, kind, name string) (kube.ResourceDiagnostics, error) {
+	f.namespace = namespace
+	return kube.ResourceDiagnostics{ResourceKind: kind, ResourceName: name}, nil
+}
+
 func TestEventsCommandListsSelectedNamespaceWarnings(t *testing.T) {
 	t.Parallel()
 

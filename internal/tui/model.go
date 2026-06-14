@@ -11,6 +11,7 @@ import (
 
 	tea "github.com/charmbracelet/bubbletea"
 	"github.com/charmbracelet/lipgloss"
+	"github.com/charmbracelet/x/ansi"
 	"github.com/nicopiov/kubewisp/internal/config"
 	"github.com/nicopiov/kubewisp/internal/doctor"
 	"github.com/nicopiov/kubewisp/internal/kube"
@@ -26,7 +27,6 @@ const (
 	workloadScreen
 	networkScreen
 	eventScreen
-	doctorScreen
 	podDetailsScreen
 	podLogsScreen
 	containerScreen
@@ -38,6 +38,7 @@ const (
 	workloadDetailsScreen
 	workloadRolloutScreen
 	workloadPodsScreen
+	resourceDiagnosticsScreen
 	networkDetailsScreen
 	servicePodsScreen
 	ingressServicesScreen
@@ -90,8 +91,6 @@ type Model struct {
 	selectedPod          string
 	selectedContainer    string
 	doctorReport         doctor.Report
-	doctorConnection     kube.ConnectivityReport
-	doctorConnectErr     error
 	ports                []kube.PodPort
 	workloads            []kube.WorkloadSummary
 	workloadPods         []kube.PodSummary
@@ -107,6 +106,7 @@ type Model struct {
 	workloadDetails      kube.WorkloadDetails
 	rolloutProgress      kube.RolloutProgress
 	rolloutTickPending   bool
+	diagnostics          kube.ResourceDiagnostics
 	cronJobDetails       kube.CronJobDetails
 	pendingWorkload      kube.NamespaceEventSummary
 	podAction            string
@@ -116,6 +116,7 @@ type Model struct {
 	podBackScreen        screen
 	workloadBackScreen   screen
 	rolloutBackScreen    screen
+	diagnosticBackScreen screen
 	networkBackScreen    screen
 	profileNames         []string
 	profileInput         string
@@ -155,12 +156,6 @@ type containersMsg struct {
 type podLogsMsg struct {
 	logs string
 	err  error
-}
-
-type doctorMsg struct {
-	report        doctor.Report
-	connection    kube.ConnectivityReport
-	connectionErr error
 }
 
 type dashboardDataMsg struct {
@@ -232,6 +227,11 @@ type eventsMsg struct {
 	err    error
 }
 
+type diagnosticsMsg struct {
+	report kube.ResourceDiagnostics
+	err    error
+}
+
 type workloadRestartedMsg struct {
 	err error
 }
@@ -287,13 +287,27 @@ var (
 	warningStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
 	healthyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
 	mutedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	helpKeyStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	helpGroupStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250"))
+	tableHeadStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250"))
 )
+
+type tableColumn struct {
+	header     string
+	alignRight bool
+}
+
+type tableRow struct {
+	cursor string
+	cells  []string
+}
 
 func NewModel(dependencies Dependencies) Model {
 	return Model{
 		dependencies: dependencies, loading: true, podBackScreen: podScreen,
 		workloadBackScreen: workloadScreen, rolloutBackScreen: workloadScreen, networkBackScreen: networkScreen,
-		loadedAt: make(map[screen]time.Time), cacheTTL: 15 * time.Second, now: time.Now,
+		diagnosticBackScreen: podDetailsScreen,
+		loadedAt:             make(map[screen]time.Time), cacheTTL: 15 * time.Second, now: time.Now,
 	}
 }
 
@@ -374,6 +388,10 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.events = message.events
 		m.markLoaded(eventScreen)
 		m.clampCursor(m.itemCount())
+	case diagnosticsMsg:
+		m.loading = false
+		m.err = message.err
+		m.diagnostics = message.report
 	case namespaceSwitchedMsg:
 		m.loading = false
 		m.err = message.err
@@ -406,13 +424,6 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = message.err
 		m.logs = message.logs
-	case doctorMsg:
-		m.loading = false
-		m.err = nil
-		m.doctorReport = message.report
-		m.doctorConnection = message.connection
-		m.doctorConnectErr = message.connectionErr
-		m.markLoaded(doctorScreen)
 	case dashboardDataMsg:
 		m.loading = false
 		m.err = message.err
@@ -486,14 +497,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = message.err
 		m.rolloutProgress = message.progress
-		if message.err == nil && m.screen == workloadRolloutScreen &&
+		if message.err == nil && m.monitoringRollout() &&
 			rolloutStillRunning(message.progress) && !m.rolloutTickPending {
 			m.rolloutTickPending = true
 			return m, rolloutTick()
 		}
 	case rolloutTickMsg:
 		m.rolloutTickPending = false
-		if m.screen == workloadRolloutScreen && rolloutStillRunning(m.rolloutProgress) {
+		if m.monitoringRollout() && rolloutStillRunning(m.rolloutProgress) {
 			m.loading = true
 			return m, m.loadRolloutProgress()
 		}
@@ -567,7 +578,8 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	if m.filtering {
 		switch key.String() {
 		case "ctrl+c":
-			return m, tea.Quit
+			m.clearFilter()
+			return m, nil
 		case "esc":
 			m.clearFilter()
 			return m, nil
@@ -591,9 +603,7 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.screen == profileRenameScreen {
 		switch key.String() {
-		case "ctrl+c":
-			return m, tea.Quit
-		case "esc":
+		case "ctrl+c", "esc":
 			m.screen = profileScreen
 			m.profileInput = ""
 			return m, nil
@@ -617,9 +627,7 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	}
 	if m.screen == profileDeleteConfirmScreen {
 		switch key.String() {
-		case "ctrl+c":
-			return m, tea.Quit
-		case "esc", "n":
+		case "ctrl+c", "esc", "n":
 			m.screen = profileScreen
 			return m, nil
 		case "y":
@@ -633,9 +641,7 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		m.screen == cronJobStateConfirmScreen) &&
 		m.dependencies.Profile.Production {
 		switch key.String() {
-		case "ctrl+c":
-			return m, tea.Quit
-		case "esc":
+		case "ctrl+c", "esc":
 			if m.screen == workloadRestartConfirmScreen || m.screen == cronJobStateConfirmScreen {
 				if m.screen == cronJobStateConfirmScreen {
 					m.screen = cronJobDetailsScreen
@@ -674,6 +680,9 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 	}
+	if key.String() == "ctrl+c" && m.isConfirmationScreen() {
+		key = tea.KeyMsg{Type: tea.KeyEsc}
+	}
 
 	switch key.String() {
 	case "ctrl+c", "q":
@@ -711,6 +720,8 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.screen = m.workloadBackScreen
 			} else if m.screen == workloadRolloutScreen {
 				m.screen = m.rolloutBackScreen
+			} else if m.screen == resourceDiagnosticsScreen {
+				m.screen = m.diagnosticBackScreen
 			} else if m.screen == workloadPodsScreen {
 				m.screen = workloadDetailsScreen
 			} else if m.screen == podDetailsScreen || m.screen == podLogsScreen || m.screen == containerScreen {
@@ -737,8 +748,6 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		return m.changeScreen(networkScreen)
 	case "6":
 		return m.changeScreen(eventScreen)
-	case "7":
-		return m.changeScreen(doctorScreen)
 	case "P":
 		if !m.isNestedScreen() {
 			m.screen = profileScreen
@@ -750,16 +759,16 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 		}
 	case "tab", "right":
 		if !m.isNestedScreen() {
-			return m.changeScreen((m.screen + 1) % 7)
+			return m.changeScreen((m.screen + 1) % 6)
 		}
 	case "shift+tab", "left":
 		if !m.isNestedScreen() {
-			return m.changeScreen((m.screen + 6) % 7)
+			return m.changeScreen((m.screen + 5) % 6)
 		}
 	case "up", "k":
 		if m.screen == podDetailsScreen || m.screen == podLogsScreen ||
 			m.screen == workloadDetailsScreen || m.screen == workloadRolloutScreen ||
-			m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
+			m.screen == resourceDiagnosticsScreen || m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
 			if m.scroll > 0 {
 				m.scroll--
 			}
@@ -771,7 +780,7 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		if m.screen == podDetailsScreen || m.screen == podLogsScreen ||
 			m.screen == workloadDetailsScreen || m.screen == workloadRolloutScreen ||
-			m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
+			m.screen == resourceDiagnosticsScreen || m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
 			m.scroll++
 			return m, nil
 		}
@@ -837,6 +846,21 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = ""
 			m.err = nil
 			return m, m.loadRolloutProgress()
+		}
+	case "v":
+		if m.screen == podDetailsScreen {
+			m.diagnosticBackScreen = podDetailsScreen
+			m.screen = resourceDiagnosticsScreen
+			m.scroll = 0
+			m.loading = true
+			return m, m.loadDiagnostics("Pod", m.selectedPod)
+		}
+		if m.screen == workloadDetailsScreen {
+			m.diagnosticBackScreen = workloadDetailsScreen
+			m.screen = resourceDiagnosticsScreen
+			m.scroll = 0
+			m.loading = true
+			return m, m.loadDiagnostics(m.selectedWorkload.Kind, m.selectedWorkload.Name)
 		}
 	case "e":
 		if (m.screen == podScreen && len(m.visiblePods()) > 0) || m.screen == podDetailsScreen {
@@ -1107,6 +1131,8 @@ func (m Model) View() string {
 			view.WriteString(m.podView())
 		case workloadPodsScreen:
 			view.WriteString(m.workloadPodsView())
+		case resourceDiagnosticsScreen:
+			view.WriteString(m.scrollView(m.resourceDiagnosticsView()))
 		case servicePodsScreen:
 			view.WriteString(m.servicePodsView())
 		case workloadScreen:
@@ -1117,8 +1143,6 @@ func (m Model) View() string {
 			view.WriteString(m.ingressServicesView())
 		case eventScreen:
 			view.WriteString(m.eventView())
-		case doctorScreen:
-			view.WriteString(m.doctorView())
 		case podDetailsScreen:
 			view.WriteString(m.scrollView(m.podDetailsView()))
 		case podLogsScreen:
@@ -1163,9 +1187,16 @@ func (m Model) View() string {
 		view.WriteString(m.filterView())
 		view.WriteString("\n")
 	}
-	view.WriteString("\n")
-	view.WriteString(mutedStyle.Render(m.responsiveHelpView()))
-	return view.String()
+	body := strings.TrimRight(m.wrapContent(view.String()), "\n")
+	footer := m.responsiveHelpView()
+	gap := 1
+	if m.height > 0 {
+		available := m.height - lipgloss.Height(body) - lipgloss.Height(footer) + 1
+		if available > gap {
+			gap = available
+		}
+	}
+	return body + strings.Repeat("\n", gap) + footer
 }
 
 func (m Model) header() string {
@@ -1187,7 +1218,7 @@ func (m Model) header() string {
 }
 
 func (m Model) tabs() string {
-	labels := []string{"Dashboard", "Namespaces", "Pods", "Workloads", "Network", "Events", "Doctor"}
+	labels := []string{"Dashboard", "Namespaces", "Pods", "Workloads", "Network", "Events"}
 	for index := range labels {
 		if screen(index) == m.screen {
 			labels[index] = activeTabStyle.Render("[" + labels[index] + "]")
@@ -1198,128 +1229,141 @@ func (m Model) tabs() string {
 
 func (m Model) helpView() string {
 	if m.filtering {
-		return "type to filter | backspace edit | enter keep filter | esc clear | ctrl+c quit"
+		return "Input: type filter | backspace edit | enter apply\nGeneral: esc cancel"
 	}
+	if confirmation := m.confirmationHelp(); confirmation != "" {
+		return confirmation
+	}
+	navigate, actions := m.contextualHelpGroups()
+	general := "r refresh | q quit"
 	if m.isNestedScreen() {
-		if m.screen == containerScreen {
-			return "up/down navigate | enter select | esc back | q quit"
-		}
-		if m.screen == portForwardScreen {
-			return "up/down navigate | enter start port-forward | esc back | q quit"
-		}
-		if m.screen == execContainerScreen {
-			return "up/down navigate | enter select | esc back | q quit"
-		}
-		if m.screen == execConfirmScreen {
-			if m.dependencies.Profile.Production {
-				return "y confirm production exec | esc cancel | q quit"
-			}
-			return "enter start shell | esc cancel | q quit"
-		}
-		if m.screen == podActionConfirmScreen {
-			if m.dependencies.Profile.Production {
-				return "type exact pod name | enter confirm | esc cancel | ctrl+c quit"
-			}
-			return "y confirm | esc cancel | q quit"
-		}
-		if m.screen == workloadRestartConfirmScreen {
-			if m.dependencies.Profile.Production {
-				return "type exact Kind/name | enter confirm | esc cancel | ctrl+c quit"
-			}
-			return "y confirm rollout restart | esc cancel | q quit"
-		}
-		if m.screen == workloadDetailsScreen {
-			return "w watch rollout | p managed pods | R rollout restart | r refresh | esc back | q quit"
-		}
-		if m.screen == workloadRolloutScreen {
-			if rolloutStillRunning(m.rolloutProgress) {
-				return "auto-refreshing every 2s | r refresh | esc back | q quit"
-			}
-			return "monitor stopped | r refresh | esc back | q quit"
-		}
-		if m.screen == workloadPodsScreen {
-			return "enter details | l logs | / filter | up/down navigate | r refresh | esc back | q quit"
-		}
-		if m.screen == servicePodsScreen {
-			return "enter details | l logs | / filter | up/down navigate | r refresh | esc back | q quit"
-		}
-		if m.screen == ingressServicesScreen {
-			return "enter details | / filter | up/down navigate | r refresh | esc back | q quit"
-		}
-		if m.screen == networkDetailsScreen {
-			if strings.EqualFold(m.selectedNetwork.Kind, "Service") {
-				return "p selected pods | r refresh | esc back | q quit"
-			}
-			if strings.EqualFold(m.selectedNetwork.Kind, "Ingress") {
-				return "s backend services | r refresh | esc back | q quit"
-			}
-			return "r refresh | esc back | q quit"
-		}
-		if m.screen == cronJobDetailsScreen {
-			return "s suspend/resume | r refresh | esc back | q quit"
-		}
-		if m.screen == cronJobStateConfirmScreen {
-			if m.dependencies.Profile.Production {
-				return "type exact CronJob/name | enter confirm | esc cancel | ctrl+c quit"
-			}
-			return "y confirm state change | esc cancel | q quit"
-		}
-		if m.screen == podDetailsScreen {
-			return "o owner workload | l logs | p port-forward | e exec | d delete | R restart | r refresh | esc back | q quit"
-		}
-		if m.screen == profileScreen {
-			return "enter switch | r rename | d delete | up/down navigate | esc back | q quit"
-		}
-		if m.screen == profileRenameScreen {
-			return "type new profile name | enter rename | esc cancel | ctrl+c quit"
-		}
-		if m.screen == profileDeleteConfirmScreen {
-			return "y confirm delete | n/esc cancel | ctrl+c quit"
-		}
-		return "r refresh | esc back | q quit"
+		general = "r refresh | esc back | q quit"
+	} else {
+		general = "1-6 screens | tab/left/right switch | P profiles | r refresh | q quit"
 	}
-	if m.screen == podScreen {
-		return "enter details | l logs | p port-forward | e exec | d delete | R restart | / filter | up/down navigate | r refresh | q quit"
+	if m.screen == profileScreen {
+		general = "esc back | q quit"
 	}
-	if m.screen == workloadScreen {
-		return m.workloadHelpView()
+	groups := make([]string, 0, 3)
+	if navigate != "" {
+		groups = append(groups, "Navigate: "+navigate)
 	}
-	if m.screen == eventScreen {
-		return "enter inspect affected object | / filter | up/down navigate | r refresh | tab/left/right screens | q quit"
+	if actions != "" {
+		groups = append(groups, "Actions:  "+actions)
 	}
-	if m.screen == networkScreen {
-		return "enter details | / filter | up/down navigate | r refresh | tab/left/right screens | q quit"
-	}
-	if m.screen == namespaceScreen {
-		return "enter switch | / filter | up/down navigate | r refresh | tab/left/right screens | q quit"
-	}
-	return "1 dashboard | 2 namespaces | 3 pods | 4 workloads | 5 network | 6 events | 7 doctor | P profiles | tab/left/right screens | r refresh | q quit"
+	return strings.Join(append(groups, "General:  "+general), "\n")
 }
 
 func (m Model) responsiveHelpView() string {
-	help := m.helpView()
-	width := m.width
-	if width <= 0 {
-		return help
+	lines := strings.Split(m.helpView(), "\n")
+	wrapped := make([]string, 0, len(lines))
+	for _, line := range lines {
+		wrapped = append(wrapped, strings.Split(wrapHelp(line, m.width), "\n")...)
 	}
-	if width < 100 {
-		replacements := []struct {
-			old string
-			new string
-		}{
-			{"up/down navigate", "up/down"},
-			{"tab/left/right screens", "tab screens"},
-			{"enter inspect affected object", "enter inspect"},
-			{"enter start port-forward", "enter start"},
-			{"type exact pod name", "type pod name"},
-			{"type exact Kind/name", "type Kind/name"},
-			{"type exact CronJob/name", "type CronJob/name"},
-		}
-		for _, replacement := range replacements {
-			help = strings.ReplaceAll(help, replacement.old, replacement.new)
-		}
+	for index, line := range wrapped {
+		wrapped[index] = renderHelpLine(line)
 	}
-	return wrapHelp(help, width)
+	return strings.Join(wrapped, "\n")
+}
+
+func (m Model) contextualHelpGroups() (string, string) {
+	navigate := "up/down move"
+	actions := ""
+	switch m.screen {
+	case dashboardScreen:
+		navigate = ""
+	case namespaceScreen:
+		navigate += " | enter switch"
+		actions = "/ filter"
+	case podScreen:
+		navigate += " | enter details"
+		actions = "/ filter | l logs | p port-forward | e exec | d delete | R restart"
+	case workloadScreen:
+		navigate += " | enter details"
+		actions = "/ filter"
+		workloads := m.visibleWorkloads()
+		if m.cursor < len(workloads) && strings.EqualFold(workloads[m.cursor].Kind, "CronJob") {
+			actions += " | s suspend/resume"
+		} else if m.cursor < len(workloads) {
+			actions += " | R rollout restart"
+		}
+	case networkScreen:
+		navigate += " | enter details"
+		actions = "/ filter"
+	case eventScreen:
+		navigate += " | enter inspect"
+		actions = "/ filter"
+	case podDetailsScreen:
+		navigate = "up/down scroll"
+		actions = "v diagnostics | o owner | l logs | p port-forward | e exec | d delete | R restart"
+	case workloadDetailsScreen:
+		navigate = "up/down scroll"
+		actions = "v diagnostics | w watch rollout | p managed pods | R rollout restart"
+	case workloadRolloutScreen:
+		navigate = "up/down scroll"
+		if rolloutStillRunning(m.rolloutProgress) {
+			actions = "auto-refreshing every 2s"
+		} else {
+			actions = "monitor stopped"
+		}
+	case workloadPodsScreen, servicePodsScreen:
+		navigate += " | enter details"
+		actions = "/ filter | l logs"
+	case ingressServicesScreen:
+		navigate += " | enter details"
+		actions = "/ filter"
+	case networkDetailsScreen:
+		navigate = "up/down scroll"
+		if strings.EqualFold(m.selectedNetwork.Kind, "Service") {
+			actions = "p selected pods"
+		} else if strings.EqualFold(m.selectedNetwork.Kind, "Ingress") {
+			actions = "s backend services"
+		}
+	case cronJobDetailsScreen:
+		navigate = "up/down scroll"
+		actions = "s suspend/resume"
+	case resourceDiagnosticsScreen, podLogsScreen:
+		navigate = "up/down scroll"
+	case containerScreen, execContainerScreen, portForwardScreen:
+		navigate += " | enter select"
+	case profileScreen:
+		navigate += " | enter switch"
+		actions = "r rename | d delete"
+	default:
+		navigate = "up/down move"
+	}
+	return navigate, actions
+}
+
+func (m Model) confirmationHelp() string {
+	switch m.screen {
+	case execConfirmScreen:
+		if m.dependencies.Profile.Production {
+			return "Actions: y confirm production exec\nGeneral: esc cancel | q quit"
+		}
+		return "Actions: enter start shell\nGeneral: esc cancel | q quit"
+	case podActionConfirmScreen:
+		if m.dependencies.Profile.Production {
+			return "Input: type exact pod name | backspace edit | enter confirm\nGeneral: esc cancel"
+		}
+		return "Actions: y confirm\nGeneral: esc cancel | q quit"
+	case workloadRestartConfirmScreen:
+		if m.dependencies.Profile.Production {
+			return "Input: type exact Kind/name | backspace edit | enter confirm\nGeneral: esc cancel"
+		}
+		return "Actions: y confirm rollout restart\nGeneral: esc cancel | q quit"
+	case cronJobStateConfirmScreen:
+		if m.dependencies.Profile.Production {
+			return "Input: type exact CronJob/name | backspace edit | enter confirm\nGeneral: esc cancel"
+		}
+		return "Actions: y confirm state change\nGeneral: esc cancel | q quit"
+	case profileRenameScreen:
+		return "Input: type new name | backspace edit | enter rename\nGeneral: esc cancel"
+	case profileDeleteConfirmScreen:
+		return "Actions: y confirm delete\nGeneral: n/esc cancel | q quit"
+	default:
+		return ""
+	}
 }
 
 func wrapHelp(help string, width int) string {
@@ -1345,6 +1389,26 @@ func wrapHelp(help string, width int) string {
 		lines = append(lines, current)
 	}
 	return strings.Join(lines, "\n")
+}
+
+func renderHelpLine(line string) string {
+	group, commands, found := strings.Cut(line, ": ")
+	if !found {
+		return mutedStyle.Render(line)
+	}
+	commands = strings.TrimSpace(commands)
+	segments := strings.Split(commands, " | ")
+	for index, segment := range segments {
+		segment = strings.TrimSpace(segment)
+		key, description, found := strings.Cut(segment, " ")
+		if !found {
+			segments[index] = helpKeyStyle.Render(segment)
+			continue
+		}
+		segments[index] = helpKeyStyle.Render(key) + " " + mutedStyle.Render(description)
+	}
+	return helpGroupStyle.Render(group+":") + " " +
+		strings.Join(segments, mutedStyle.Render(" | "))
 }
 
 func (m Model) profileView() string {
@@ -1419,18 +1483,20 @@ func dependencyStatusLines(report doctor.Report) []string {
 	if len(report.Checks) == 0 {
 		return []string{mutedStyle.Render("Checking...")}
 	}
-	lines := make([]string, 0, len(report.Checks)+1)
+	lines := make([]string, 0, len(report.Checks)*3)
 	for _, check := range report.Checks {
 		if check.Passed() {
 			lines = append(lines, healthyStyle.Render("● pass")+" "+check.Dependency.Name)
+			lines = append(lines, mutedStyle.Render("  "+check.Path))
 			continue
 		}
 		lines = append(lines, errorStyle.Render("● fail")+" "+check.Dependency.Name)
+		lines = append(lines, mutedStyle.Render("  not found"))
 	}
 	if report.Healthy() {
 		lines = append(lines, "", healthyStyle.Render("All available"))
 	} else {
-		lines = append(lines, "", warningStyle.Render("Open Doctor for guidance"))
+		lines = append(lines, "", warningStyle.Render("Run kubewisp doctor for details"))
 	}
 	return lines
 }
@@ -1467,33 +1533,6 @@ func (m Model) namespaceView() string {
 		fmt.Fprintf(&view, "%s%s%s\n", cursor, namespace, active)
 	}
 	view.WriteString("\nEnter switches namespace for this profile.")
-	return view.String()
-}
-
-func (m Model) doctorView() string {
-	var view strings.Builder
-	fmt.Fprintln(&view, "Local Dependencies")
-	for _, check := range m.doctorReport.Checks {
-		if check.Passed() {
-			fmt.Fprintf(&view, "%s  %-24s %s\n", healthyStyle.Render("● pass"), check.Dependency.Name, check.Path)
-			continue
-		}
-		fmt.Fprintf(&view, "%s  %-24s not found\n", errorStyle.Render("● fail"), check.Dependency.Name)
-		fmt.Fprintf(&view, "        Install %s: %s\n", check.Dependency.Description, check.Dependency.InstallURL)
-	}
-
-	fmt.Fprintln(&view, "\nCluster Connectivity")
-	if m.doctorConnectErr != nil {
-		fmt.Fprintf(&view, "%s  Kubernetes API and namespace: %s\n", errorStyle.Render("● fail"), m.doctorConnectErr)
-		return view.String()
-	}
-	fmt.Fprintf(
-		&view,
-		"%s  Kubernetes API %s | namespace %s\n",
-		healthyStyle.Render("● pass"),
-		valueOrDash(m.doctorConnection.ServerVersion),
-		valueOrDash(m.doctorConnection.Namespace),
-	)
 	return view.String()
 }
 
@@ -1537,26 +1576,31 @@ func (m Model) servicePodsView() string {
 }
 
 func podListView(pods []kube.PodSummary, cursorIndex int) string {
-	var view strings.Builder
-	fmt.Fprintln(&view, "  HEALTH | NAME | READY | STATUS | RESTARTS | AGE")
+	rows := make([]tableRow, 0, len(pods))
 	for index, pod := range pods {
 		cursor := "  "
 		if index == cursorIndex {
 			cursor = "> "
 		}
-		fmt.Fprintf(
-			&view,
-			"%s%s | %s | %s | %s | %d | %s\n",
-			cursor,
+		rows = append(rows, tableRow{cursor: cursor, cells: []string{
 			podStatusMarker(pod),
 			pod.Name,
 			pod.Ready,
 			pod.Status,
-			pod.Restarts,
+			fmt.Sprintf("%d", pod.Restarts),
+			fmt.Sprintf("%d", pod.WarningCount),
 			formatAge(time.Now(), pod.CreatedAt),
-		)
+		}})
 	}
-	return view.String()
+	return renderTable([]tableColumn{
+		{header: "HEALTH"},
+		{header: "NAME"},
+		{header: "READY", alignRight: true},
+		{header: "STATUS"},
+		{header: "RESTARTS", alignRight: true},
+		{header: "WARNINGS", alignRight: true},
+		{header: "AGE", alignRight: true},
+	}, rows)
 }
 
 func (m Model) workloadView() string {
@@ -1567,38 +1611,33 @@ func (m Model) workloadView() string {
 	if len(workloads) == 0 {
 		return m.noFilterMatchesView()
 	}
-	var view strings.Builder
-	fmt.Fprintln(&view, "  HEALTH | KIND | NAME | STATUS | SCHEDULE | LAST RUN | AGE")
+	rows := make([]tableRow, 0, len(workloads))
 	for index, workload := range workloads {
 		cursor := "  "
 		if index == m.cursor {
 			cursor = "> "
 		}
-		fmt.Fprintf(
-			&view,
-			"%s%s | %s | %s | %s | %s | %s | %s\n",
-			cursor,
+		rows = append(rows, tableRow{cursor: cursor, cells: []string{
 			workloadStatusMarker(workload),
 			workload.Kind,
 			workload.Name,
 			workloadStatusText(workload),
+			fmt.Sprintf("%d", workload.WarningCount),
 			valueOrDash(workload.Schedule),
 			formatAge(time.Now(), workload.LastScheduleTime),
 			formatAge(time.Now(), workload.CreatedAt),
-		)
+		}})
 	}
-	return view.String()
-}
-
-func (m Model) workloadHelpView() string {
-	workloads := m.visibleWorkloads()
-	if len(workloads) == 0 || m.cursor >= len(workloads) {
-		return "/ filter | r refresh | tab/left/right screens | q quit"
-	}
-	if strings.EqualFold(workloads[m.cursor].Kind, "CronJob") {
-		return "enter details | s suspend/resume | / filter | up/down navigate | r refresh | q quit"
-	}
-	return "enter details | R rollout restart | / filter | up/down navigate | r refresh | q quit"
+	return renderTable([]tableColumn{
+		{header: "HEALTH"},
+		{header: "KIND"},
+		{header: "NAME"},
+		{header: "STATUS"},
+		{header: "WARNINGS", alignRight: true},
+		{header: "SCHEDULE"},
+		{header: "LAST RUN", alignRight: true},
+		{header: "AGE", alignRight: true},
+	}, rows)
 }
 
 func (m Model) networkView() string {
@@ -1627,8 +1666,7 @@ func (m Model) ingressServicesView() string {
 }
 
 func networkListView(resources []kube.NetworkSummary, cursorIndex int) string {
-	var view strings.Builder
-	fmt.Fprintln(&view, "  KIND | NAME | TYPE/CLASS | ADDRESS | PORTS/HOSTS | AGE")
+	rows := make([]tableRow, 0, len(resources))
 	for index, resource := range resources {
 		cursor := "  "
 		if index == cursorIndex {
@@ -1638,11 +1676,23 @@ func networkListView(resources []kube.NetworkSummary, cursorIndex int) string {
 		if resource.Kind == "Ingress" {
 			exposure = strings.Join(resource.Hosts, ", ")
 		}
-		fmt.Fprintf(&view, "%s%s | %s | %s | %s | %s | %s\n",
-			cursor, resource.Kind, resource.Name, resource.Type, valueOrDash(resource.Address),
-			valueOrDash(exposure), formatAge(time.Now(), resource.CreatedAt))
+		rows = append(rows, tableRow{cursor: cursor, cells: []string{
+			resource.Kind,
+			resource.Name,
+			resource.Type,
+			valueOrDash(resource.Address),
+			valueOrDash(exposure),
+			formatAge(time.Now(), resource.CreatedAt),
+		}})
 	}
-	return view.String()
+	return renderTable([]tableColumn{
+		{header: "KIND"},
+		{header: "NAME"},
+		{header: "TYPE/CLASS"},
+		{header: "ADDRESS"},
+		{header: "PORTS/HOSTS"},
+		{header: "AGE", alignRight: true},
+	}, rows)
 }
 
 func (m Model) eventView() string {
@@ -1653,26 +1703,68 @@ func (m Model) eventView() string {
 	if len(events) == 0 {
 		return m.noFilterMatchesView()
 	}
-	var view strings.Builder
-	fmt.Fprintln(&view, "  LAST SEEN | COUNT | OBJECT | REASON | MESSAGE")
+	rows := make([]tableRow, 0, len(events))
 	for index, event := range events {
 		cursor := "  "
 		if index == m.cursor {
 			cursor = "> "
 		}
-		fmt.Fprintf(
-			&view,
-			"%s%s | %d | %s/%s | %s | %s\n",
-			cursor,
+		rows = append(rows, tableRow{cursor: cursor, cells: []string{
 			warningStyle.Render(formatAge(time.Now(), event.LastSeen)),
-			event.Count,
-			event.ObjectKind,
-			event.ObjectName,
+			fmt.Sprintf("%d", event.Count),
+			event.ObjectKind + "/" + event.ObjectName,
 			event.Reason,
 			event.Message,
-		)
+		}})
+	}
+	return renderTable([]tableColumn{
+		{header: "LAST SEEN", alignRight: true},
+		{header: "COUNT", alignRight: true},
+		{header: "OBJECT"},
+		{header: "REASON"},
+		{header: "MESSAGE"},
+	}, rows)
+}
+
+func renderTable(columns []tableColumn, rows []tableRow) string {
+	widths := make([]int, len(columns))
+	for index, column := range columns {
+		widths[index] = lipgloss.Width(column.header)
+	}
+	for _, row := range rows {
+		for index, cell := range row.cells {
+			if index < len(widths) {
+				widths[index] = max(widths[index], lipgloss.Width(cell))
+			}
+		}
+	}
+
+	var view strings.Builder
+	headers := make([]string, len(columns))
+	for index, column := range columns {
+		headers[index] = tableHeadStyle.Render(padTableCell(column.header, widths[index], column.alignRight))
+	}
+	fmt.Fprintf(&view, "  %s\n", strings.Join(headers, mutedStyle.Render(" | ")))
+	for _, row := range rows {
+		cells := make([]string, len(columns))
+		for index, column := range columns {
+			value := ""
+			if index < len(row.cells) {
+				value = row.cells[index]
+			}
+			cells[index] = padTableCell(value, widths[index], column.alignRight)
+		}
+		fmt.Fprintf(&view, "%s%s\n", row.cursor, strings.Join(cells, mutedStyle.Render(" | ")))
 	}
 	return view.String()
+}
+
+func padTableCell(value string, width int, alignRight bool) string {
+	padding := strings.Repeat(" ", max(0, width-lipgloss.Width(value)))
+	if alignRight {
+		return padding + value
+	}
+	return value + padding
 }
 
 func (m Model) podDetailsView() string {
@@ -1755,6 +1847,7 @@ func (m Model) podLogsView() string {
 }
 
 func (m Model) scrollView(content string) string {
+	content = m.wrapContent(content)
 	lines := strings.Split(content, "\n")
 	visible := m.height - 9
 	if visible <= 0 || len(lines) <= visible {
@@ -1763,6 +1856,13 @@ func (m Model) scrollView(content string) string {
 	scroll := min(m.scroll, len(lines)-visible)
 	return strings.Join(lines[scroll:scroll+visible], "\n") +
 		"\n\n" + mutedStyle.Render(fmt.Sprintf("lines %d-%d of %d", scroll+1, scroll+visible, len(lines)))
+}
+
+func (m Model) wrapContent(content string) string {
+	if m.width <= 0 {
+		return content
+	}
+	return ansi.Wrap(content, m.width, "")
 }
 
 func (m Model) containerView() string {
@@ -1904,6 +2004,37 @@ func (m Model) workloadDetailsView() string {
 			condition.Status,
 			valueOrDash(condition.Reason),
 			valueOrDash(condition.Message),
+		)
+	}
+	return view.String()
+}
+
+func (m Model) resourceDiagnosticsView() string {
+	report := m.diagnostics
+	var view strings.Builder
+	fmt.Fprintf(&view, "Diagnostics: %s/%s\n\n", report.ResourceKind, report.ResourceName)
+	fmt.Fprintf(&view, "Summary: %s\n", report.Summary)
+	fmt.Fprintln(&view, "\nPossible Causes:")
+	if len(report.Causes) == 0 {
+		fmt.Fprintln(&view, "  -")
+	}
+	for _, cause := range report.Causes {
+		fmt.Fprintf(&view, "  %s\n", cause)
+	}
+	fmt.Fprintln(&view, "\nRelated Warning Events:")
+	if len(report.Events) == 0 {
+		fmt.Fprintln(&view, "  -")
+	}
+	for _, event := range report.Events {
+		fmt.Fprintf(
+			&view,
+			"  %s/%s | %s | count=%d | last=%s\n    %s\n",
+			event.ObjectKind,
+			event.ObjectName,
+			event.Reason,
+			event.Count,
+			formatAge(time.Now(), event.LastSeen),
+			event.Message,
 		)
 	}
 	return view.String()
@@ -2132,15 +2263,6 @@ func (m Model) loadCurrent() tea.Cmd {
 		return m.loadNetwork()
 	case eventScreen:
 		return m.loadEvents()
-	case doctorScreen:
-		return func() tea.Msg {
-			report := doctor.Report{}
-			if m.dependencies.Doctor != nil {
-				report = m.dependencies.Doctor.Run(context.Background())
-			}
-			connection, err := m.dependencies.Connectivity.Check(context.Background(), namespace)
-			return doctorMsg{report: report, connection: connection, connectionErr: err}
-		}
 	case podDetailsScreen:
 		return m.loadPodDetails()
 	case containerScreen:
@@ -2159,6 +2281,8 @@ func (m Model) loadCurrent() tea.Cmd {
 		return m.loadRolloutProgress()
 	case workloadPodsScreen:
 		return m.loadWorkloadPods()
+	case resourceDiagnosticsScreen:
+		return m.loadDiagnostics(m.diagnostics.ResourceKind, m.diagnostics.ResourceName)
 	case servicePodsScreen:
 		return m.loadServicePods()
 	case networkDetailsScreen:
@@ -2212,6 +2336,17 @@ func (m Model) loadWorkloadDetails() tea.Cmd {
 	}
 }
 
+func (m Model) loadDiagnostics(kind, name string) tea.Cmd {
+	namespace := selectedNamespace(m.dependencies.Profile)
+	return func() tea.Msg {
+		if m.dependencies.Events == nil {
+			return diagnosticsMsg{err: errors.New("Kubernetes event service is not configured")}
+		}
+		report, err := m.dependencies.Events.Diagnose(context.Background(), namespace, kind, name)
+		return diagnosticsMsg{report: report, err: err}
+	}
+}
+
 func (m Model) loadRolloutProgress() tea.Cmd {
 	namespace := selectedNamespace(m.dependencies.Profile)
 	return func() tea.Msg {
@@ -2236,6 +2371,10 @@ func rolloutTick() tea.Cmd {
 
 func rolloutStillRunning(progress kube.RolloutProgress) bool {
 	return !progress.Complete && !strings.EqualFold(progress.Status, "Stalled")
+}
+
+func (m Model) monitoringRollout() bool {
+	return m.screen == workloadRolloutScreen
 }
 
 func (m Model) loadCronJobDetails() tea.Cmd {
@@ -2696,16 +2835,26 @@ func (m Model) unfilteredItemCount() int {
 }
 
 func (m Model) isNestedScreen() bool {
-	return m.screen == podDetailsScreen || m.screen == podLogsScreen ||
-		m.screen == containerScreen || m.screen == portForwardScreen ||
-		m.screen == execContainerScreen || m.screen == execConfirmScreen ||
-		m.screen == podActionConfirmScreen || m.screen == workloadRestartConfirmScreen ||
-		m.screen == workloadDetailsScreen || m.screen == workloadRolloutScreen ||
-		m.screen == workloadPodsScreen || m.screen == networkDetailsScreen ||
-		m.screen == servicePodsScreen || m.screen == ingressServicesScreen ||
-		m.screen == cronJobDetailsScreen ||
-		m.screen == cronJobStateConfirmScreen || m.screen == profileScreen ||
-		m.screen == profileRenameScreen || m.screen == profileDeleteConfirmScreen
+	return m.isNestedTarget(m.screen)
+}
+
+func (m Model) isConfirmationScreen() bool {
+	return m.screen == execConfirmScreen || m.screen == podActionConfirmScreen ||
+		m.screen == workloadRestartConfirmScreen || m.screen == cronJobStateConfirmScreen ||
+		m.screen == profileDeleteConfirmScreen
+}
+
+func (m Model) isNestedTarget(target screen) bool {
+	return target == podDetailsScreen || target == podLogsScreen ||
+		target == containerScreen || target == portForwardScreen ||
+		target == execContainerScreen || target == execConfirmScreen ||
+		target == podActionConfirmScreen || target == workloadRestartConfirmScreen ||
+		target == workloadDetailsScreen || target == workloadRolloutScreen ||
+		target == workloadPodsScreen || target == resourceDiagnosticsScreen || target == networkDetailsScreen ||
+		target == servicePodsScreen || target == ingressServicesScreen ||
+		target == cronJobDetailsScreen ||
+		target == cronJobStateConfirmScreen || target == profileScreen ||
+		target == profileRenameScreen || target == profileDeleteConfirmScreen
 }
 
 func (m *Model) markLoaded(value screen) {
@@ -2731,6 +2880,7 @@ func (m *Model) resetClusterData() {
 	m.workloadPods = nil
 	m.rolloutProgress = kube.RolloutProgress{}
 	m.rolloutTickPending = false
+	m.diagnostics = kube.ResourceDiagnostics{}
 	m.servicePods = nil
 	m.networkResources = nil
 	m.ingressServices = nil

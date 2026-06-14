@@ -93,7 +93,7 @@ remembers the selected profile.
 
 | Key | Action |
 | --- | --- |
-| `1`-`7` | Open Dashboard, Namespaces, Pods, Workloads, Network, Events, or Doctor |
+| `1`-`6` | Open Dashboard, Namespaces, Pods, Workloads, Network, or Events |
 | `Tab`, `Left`, `Right` | Move between top-level screens |
 | `Up`, `Down`, `j`, `k` | Navigate lists or scroll details |
 | `Enter` | Open or select the highlighted resource |
@@ -103,8 +103,15 @@ remembers the selected profile.
 | `Esc` | Return to the previous screen |
 | `q` | Quit |
 
-The contextual help bar changes with the selected resource, compacts on smaller
-terminals, and wraps at action boundaries.
+The contextual help bar groups movement and opening resources under
+`Navigate`, contextual operations such as filtering under `Actions`, and
+application-wide controls such as tab switching under `General`. It changes
+with the current screen and highlighted resource, then wraps each group for
+smaller terminals. Shortcut keys are highlighted separately from their
+descriptions, and the helper remains anchored at the bottom of the terminal.
+While entering text or confirming an operation, `Esc` or `Ctrl+C` cancels the
+current interaction without quitting Kubewisp. Screen content wraps to the
+terminal width, and wrapped detail views remain vertically scrollable.
 
 On Namespaces, Pods, Workloads, Network, Events, and relationship lists, press
 `/` and type to filter immediately. `Enter` keeps the filter while navigating;
@@ -117,9 +124,11 @@ The Dashboard shows responsive cards for:
 
 - Active project, cluster, region or zone, namespace, and Kubernetes version
 - Healthy, completed, warning, and unhealthy pod counts
-- Availability of `gcloud`, `kubectl`, and `gke-gcloud-auth-plugin`
+- Availability and resolved executable paths for `gcloud`, `kubectl`, and
+  `gke-gcloud-auth-plugin`
 
 Cards sit side by side in wide terminals and stack in narrow terminals.
+Run `kubewisp doctor` when a missing dependency needs installation guidance.
 
 ### Profiles
 
@@ -143,22 +152,30 @@ cached cluster data, and reloads the dashboard.
 | `d` | Delete after confirmation |
 | `R` | Restart a controller-managed pod after confirmation |
 
+The Pods list includes the total Warning event count attached to each pod.
 Pod details include owners, conditions, container states, images, resources,
 ports, mounts, probes, network identity, service account, QoS, labels,
 annotation names, and recent events. Environment and annotation values are not
 shown. Application logs are printed exactly as produced and may contain
 sensitive values.
 
+Press `v` from Pod details for resource-aware diagnostics. Kubewisp combines
+container states, restart history, failed conditions, and Warning events into a
+short likely-cause summary without exposing environment or Secret values.
+
 ### Workloads
 
 The Workloads screen combines Deployments, StatefulSets, DaemonSets, and
-CronJobs.
+CronJobs. Warning counts attached directly to each workload are shown in the
+list.
 
 - Enter a replica workload for rollout details, conditions, images, and its
   managed pods.
 - Press `w` from workload details to monitor rollout generation, revision,
   replica replacement, conditions, and pods. The monitor refreshes every two
   seconds until the rollout completes or stalls.
+- Press `v` from replica-workload details to diagnose the workload together
+  with warnings from its selected pods.
 - From Pod details, press `o` to open its owning workload. Kubewisp follows
   ReplicaSet-to-Deployment and Job-to-CronJob ownership chains.
 - Press `R` for a guarded rollout restart.

@@ -45,6 +45,7 @@ type WorkloadSummary struct {
 	LastScheduleTime   time.Time
 	LastSuccessfulTime time.Time
 	CreatedAt          time.Time
+	WarningCount       int32
 }
 
 type CronJobDetails struct {
@@ -120,9 +121,10 @@ func (s *Workloads) List(ctx context.Context, namespace string) ([]WorkloadSumma
 	var statefulSets *appsv1.StatefulSetList
 	var daemonSets *appsv1.DaemonSetList
 	var cronJobs *batchv1.CronJobList
-	var deploymentErr, statefulSetErr, daemonSetErr, cronJobErr error
+	var events *corev1.EventList
+	var deploymentErr, statefulSetErr, daemonSetErr, cronJobErr, eventErr error
 	var wait sync.WaitGroup
-	wait.Add(4)
+	wait.Add(5)
 	go func() {
 		defer wait.Done()
 		deployments, deploymentErr = client.AppsV1().Deployments(namespace).List(ctx, metav1.ListOptions{})
@@ -138,6 +140,12 @@ func (s *Workloads) List(ctx context.Context, namespace string) ([]WorkloadSumma
 	go func() {
 		defer wait.Done()
 		cronJobs, cronJobErr = client.BatchV1().CronJobs(namespace).List(ctx, metav1.ListOptions{})
+	}()
+	go func() {
+		defer wait.Done()
+		events, eventErr = client.CoreV1().Events(namespace).List(ctx, metav1.ListOptions{
+			FieldSelector: "type=" + corev1.EventTypeWarning,
+		})
 	}()
 	wait.Wait()
 	if deploymentErr != nil {
@@ -189,6 +197,12 @@ func (s *Workloads) List(ctx context.Context, namespace string) ([]WorkloadSumma
 	}
 	for index := range cronJobs.Items {
 		workloads = append(workloads, summarizeCronJob(&cronJobs.Items[index]))
+	}
+	if eventErr == nil {
+		counts := warningCountByObject(events.Items)
+		for index := range workloads {
+			workloads[index].WarningCount = counts[workloads[index].Kind+"\x00"+workloads[index].Name]
+		}
 	}
 	sort.Slice(workloads, func(i, j int) bool {
 		if workloads[i].Kind == workloads[j].Kind {

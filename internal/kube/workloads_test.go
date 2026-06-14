@@ -53,6 +53,12 @@ func TestWorkloadsListSummarizesKinds(t *testing.T) {
 				LastSuccessfulTime: &lastSuccess,
 			},
 		},
+		&corev1.Event{
+			ObjectMeta:     metav1.ObjectMeta{Name: "api-failed", Namespace: "apps"},
+			InvolvedObject: corev1.ObjectReference{Kind: "Deployment", Name: "api"},
+			Type:           corev1.EventTypeWarning,
+			Count:          2,
+		},
 	)
 
 	workloads, err := NewWorkloadServiceWithFactory(fakeFactory{client: client}).List(context.Background(), "apps")
@@ -69,7 +75,7 @@ func TestWorkloadsListSummarizesKinds(t *testing.T) {
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("workloads = %#v, want %#v", got, want)
 	}
-	if workloads[2].Ready != 2 || workloads[2].Desired != 3 {
+	if workloads[2].Ready != 2 || workloads[2].Desired != 3 || workloads[2].WarningCount != 2 {
 		t.Fatalf("deployment summary = %#v", workloads[2])
 	}
 	if workloads[0].Schedule != "0 * * * *" || workloads[0].Active != 1 || !workloads[0].Suspended ||
