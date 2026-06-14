@@ -169,6 +169,45 @@ func TestWorkloadsPodsUsesControllerSelector(t *testing.T) {
 	}
 }
 
+func TestWorkloadsOwnerForPodResolvesControllerChains(t *testing.T) {
+	t.Parallel()
+
+	controller := true
+	client := fake.NewSimpleClientset(
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "apps"},
+			Status:     appsv1.DeploymentStatus{ReadyReplicas: 2},
+		},
+		&appsv1.ReplicaSet{ObjectMeta: metav1.ObjectMeta{
+			Name: "api-abc", Namespace: "apps",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "Deployment", Name: "api", Controller: &controller}},
+		}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "api-abc-123", Namespace: "apps",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "ReplicaSet", Name: "api-abc", Controller: &controller}},
+		}},
+		&batchv1.CronJob{ObjectMeta: metav1.ObjectMeta{Name: "cleanup", Namespace: "apps"}},
+		&batchv1.Job{ObjectMeta: metav1.ObjectMeta{
+			Name: "cleanup-123", Namespace: "apps",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "CronJob", Name: "cleanup", Controller: &controller}},
+		}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{
+			Name: "cleanup-123-abc", Namespace: "apps",
+			OwnerReferences: []metav1.OwnerReference{{Kind: "Job", Name: "cleanup-123", Controller: &controller}},
+		}},
+	)
+	service := NewWorkloadServiceWithFactory(fakeFactory{client: client})
+
+	deployment, err := service.OwnerForPod(context.Background(), "apps", "api-abc-123")
+	if err != nil || deployment.Kind != "Deployment" || deployment.Name != "api" {
+		t.Fatalf("deployment owner = %#v, error = %v", deployment, err)
+	}
+	cronJob, err := service.OwnerForPod(context.Background(), "apps", "cleanup-123-abc")
+	if err != nil || cronJob.Kind != "CronJob" || cronJob.Name != "cleanup" {
+		t.Fatalf("CronJob owner = %#v, error = %v", cronJob, err)
+	}
+}
+
 func TestWorkloadsDescribeCronJobIncludesOwnedJobs(t *testing.T) {
 	t.Parallel()
 
@@ -257,5 +296,86 @@ func TestWorkloadsRolloutRestartUpdatesTemplateAnnotation(t *testing.T) {
 	}
 	if got := workload.Spec.Template.Annotations[restartedAtAnnotation]; got != now.Format(time.RFC3339) {
 		t.Fatalf("annotation = %q", got)
+	}
+}
+
+func TestWorkloadsRolloutProgressSummarizesDeploymentAndPods(t *testing.T) {
+	t.Parallel()
+
+	replicas := int32(3)
+	restarted := "2026-06-14T10:00:00Z"
+	client := fake.NewSimpleClientset(
+		&appsv1.Deployment{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "api", Namespace: "apps", Generation: 4,
+				Annotations: map[string]string{deploymentRevisionAnnotation: "7"},
+			},
+			Spec: appsv1.DeploymentSpec{
+				Replicas: &replicas,
+				Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "api"}},
+				Template: corev1.PodTemplateSpec{ObjectMeta: metav1.ObjectMeta{
+					Annotations: map[string]string{restartedAtAnnotation: restarted},
+				}},
+			},
+			Status: appsv1.DeploymentStatus{
+				ObservedGeneration: 4, ReadyReplicas: 2, UpdatedReplicas: 2, AvailableReplicas: 2,
+				Conditions: []appsv1.DeploymentCondition{{
+					Type: appsv1.DeploymentProgressing, Status: corev1.ConditionTrue,
+					Reason: "ReplicaSetUpdated", Message: "ReplicaSet api-new is progressing.",
+				}},
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "api-old", Namespace: "apps", Labels: map[string]string{"app": "api"},
+				CreationTimestamp: metav1.NewTime(time.Date(2026, 6, 14, 9, 0, 0, 0, time.UTC)),
+			},
+		},
+		&corev1.Pod{
+			ObjectMeta: metav1.ObjectMeta{
+				Name: "api-new", Namespace: "apps", Labels: map[string]string{"app": "api"},
+				CreationTimestamp: metav1.NewTime(time.Date(2026, 6, 14, 10, 0, 0, 0, time.UTC)),
+			},
+		},
+	)
+
+	progress, err := NewWorkloadServiceWithFactory(fakeFactory{client: client}).RolloutProgress(
+		context.Background(), "apps", "Deployment", "api",
+	)
+	if err != nil {
+		t.Fatalf("RolloutProgress() error = %v", err)
+	}
+	if progress.Complete || progress.Generation != 4 || progress.ObservedGeneration != 4 ||
+		progress.Revision != "7" || progress.Status != "Progressing" || progress.Reason != "ReplicaSetUpdated" {
+		t.Fatalf("progress = %#v", progress)
+	}
+	if progress.RestartedAt.Format(time.RFC3339) != restarted ||
+		len(progress.Pods) != 2 || progress.Pods[0].Name != "api-new" {
+		t.Fatalf("progress pods/restart = %#v", progress)
+	}
+}
+
+func TestWorkloadsRolloutProgressDetectsCompletionAndStatefulSetRevisions(t *testing.T) {
+	t.Parallel()
+
+	replicas := int32(2)
+	client := fake.NewSimpleClientset(&appsv1.StatefulSet{
+		ObjectMeta: metav1.ObjectMeta{Name: "db", Namespace: "apps", Generation: 3},
+		Spec: appsv1.StatefulSetSpec{
+			Replicas: &replicas,
+			Selector: &metav1.LabelSelector{MatchLabels: map[string]string{"app": "db"}},
+		},
+		Status: appsv1.StatefulSetStatus{
+			ObservedGeneration: 3, ReadyReplicas: 2, UpdatedReplicas: 2, AvailableReplicas: 2,
+			CurrentRevision: "db-abc", UpdateRevision: "db-abc",
+		},
+	})
+
+	progress, err := NewWorkloadServiceWithFactory(fakeFactory{client: client}).RolloutProgress(
+		context.Background(), "apps", "StatefulSet", "db",
+	)
+	if err != nil || !progress.Complete || progress.Status != "Complete" ||
+		progress.CurrentRevision != "db-abc" || progress.UpdateRevision != "db-abc" {
+		t.Fatalf("RolloutProgress() = %#v, error = %v", progress, err)
 	}
 }

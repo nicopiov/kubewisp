@@ -45,6 +45,13 @@ func (f *fakeWorkloads) RolloutRestart(_ context.Context, namespace, kind, name 
 	return nil
 }
 
+func (f *fakeWorkloads) RolloutProgress(_ context.Context, namespace, kind, name string) (kube.RolloutProgress, error) {
+	f.namespace = namespace
+	f.kind = kind
+	f.name = name
+	return kube.RolloutProgress{}, nil
+}
+
 func (f *fakeWorkloads) DescribeCronJob(_ context.Context, namespace, name string) (kube.CronJobDetails, error) {
 	f.namespace = namespace
 	f.name = name
@@ -63,6 +70,12 @@ func (f *fakeWorkloads) Pods(_ context.Context, namespace, kind, name string) ([
 	f.kind = kind
 	f.name = name
 	return nil, nil
+}
+
+func (f *fakeWorkloads) OwnerForPod(_ context.Context, namespace, name string) (kube.WorkloadSummary, error) {
+	f.namespace = namespace
+	f.name = name
+	return kube.WorkloadSummary{}, nil
 }
 
 func (f *fakeWorkloads) SetCronJobSuspended(_ context.Context, namespace, name string, suspended bool) error {

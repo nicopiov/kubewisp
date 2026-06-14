@@ -12,12 +12,15 @@ import (
 	discoveryv1 "k8s.io/api/discovery/v1"
 	networkingv1 "k8s.io/api/networking/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
+	"k8s.io/apimachinery/pkg/labels"
 	"k8s.io/client-go/kubernetes"
 )
 
 type NetworkService interface {
 	List(ctx context.Context, namespace string) ([]NetworkSummary, error)
 	Describe(ctx context.Context, namespace, kind, name string) (NetworkDetails, error)
+	PodsForService(ctx context.Context, namespace, name string) ([]PodSummary, error)
+	ServicesForIngress(ctx context.Context, namespace, name string) ([]NetworkSummary, error)
 }
 
 type NetworkSummary struct {
@@ -76,12 +79,7 @@ func (s *Network) List(ctx context.Context, namespace string) ([]NetworkSummary,
 	}
 	resources := make([]NetworkSummary, 0, len(services.Items)+len(ingresses.Items))
 	for index := range services.Items {
-		service := &services.Items[index]
-		resources = append(resources, NetworkSummary{
-			Kind: "Service", Name: service.Name, Type: string(service.Spec.Type),
-			Address: serviceAddress(service.Spec.ClusterIP, service.Status.LoadBalancer.Ingress),
-			Ports:   servicePorts(service.Spec.Ports), CreatedAt: service.CreationTimestamp.Time,
-		})
+		resources = append(resources, summarizeService(&services.Items[index]))
 	}
 	for index := range ingresses.Items {
 		ingress := &ingresses.Items[index]
@@ -111,11 +109,10 @@ func (s *Network) Describe(ctx context.Context, namespace, kind, name string) (N
 		if err != nil {
 			return NetworkDetails{}, diagnose(fmt.Sprintf("get service %q in namespace %q", name, namespace), err)
 		}
-		details := NetworkDetails{NetworkSummary: NetworkSummary{
-			Kind: "Service", Name: service.Name, Type: string(service.Spec.Type),
-			Address: serviceAddress(service.Spec.ClusterIP, service.Status.LoadBalancer.Ingress),
-			Ports:   servicePorts(service.Spec.Ports), CreatedAt: service.CreationTimestamp.Time,
-		}, Selector: sortedMap(service.Spec.Selector)}
+		details := NetworkDetails{
+			NetworkSummary: summarizeService(service),
+			Selector:       sortedMap(service.Spec.Selector),
+		}
 		endpoints, endpointErr := client.DiscoveryV1().EndpointSlices(namespace).List(ctx, metav1.ListOptions{
 			LabelSelector: discoveryv1.LabelServiceName + "=" + name,
 		})
@@ -152,8 +149,88 @@ func (s *Network) Describe(ctx context.Context, namespace, kind, name string) (N
 	}
 }
 
+func (s *Network) PodsForService(ctx context.Context, namespace, name string) ([]PodSummary, error) {
+	client, err := s.client()
+	if err != nil {
+		return nil, err
+	}
+	service, err := client.CoreV1().Services(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, diagnose(fmt.Sprintf("get service %q in namespace %q", name, namespace), err)
+	}
+	if len(service.Spec.Selector) == 0 {
+		return nil, nil
+	}
+	list, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{
+		LabelSelector: labels.SelectorFromSet(service.Spec.Selector).String(),
+	})
+	if err != nil {
+		return nil, diagnose(fmt.Sprintf("list pods selected by service %q in namespace %q", name, namespace), err)
+	}
+	pods := make([]PodSummary, 0, len(list.Items))
+	for index := range list.Items {
+		pods = append(pods, summarizePod(&list.Items[index]))
+	}
+	sort.Slice(pods, func(i, j int) bool {
+		return pods[i].Name < pods[j].Name
+	})
+	return pods, nil
+}
+
+func (s *Network) ServicesForIngress(ctx context.Context, namespace, name string) ([]NetworkSummary, error) {
+	client, err := s.client()
+	if err != nil {
+		return nil, err
+	}
+	ingress, err := client.NetworkingV1().Ingresses(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return nil, diagnose(fmt.Sprintf("get ingress %q in namespace %q", name, namespace), err)
+	}
+	names := ingressServiceNames(ingress)
+	services := make([]NetworkSummary, 0, len(names))
+	for _, serviceName := range names {
+		service, err := client.CoreV1().Services(namespace).Get(ctx, serviceName, metav1.GetOptions{})
+		if err != nil {
+			return nil, diagnose(fmt.Sprintf("get service %q used by ingress %q in namespace %q", serviceName, name, namespace), err)
+		}
+		services = append(services, summarizeService(service))
+	}
+	return services, nil
+}
+
 func (s *Network) client() (kubernetes.Interface, error) {
 	return s.factory.Client()
+}
+
+func summarizeService(service *corev1.Service) NetworkSummary {
+	return NetworkSummary{
+		Kind: "Service", Name: service.Name, Type: string(service.Spec.Type),
+		Address: serviceAddress(service.Spec.ClusterIP, service.Status.LoadBalancer.Ingress),
+		Ports:   servicePorts(service.Spec.Ports), CreatedAt: service.CreationTimestamp.Time,
+	}
+}
+
+func ingressServiceNames(ingress *networkingv1.Ingress) []string {
+	seen := make(map[string]struct{})
+	if ingress.Spec.DefaultBackend != nil && ingress.Spec.DefaultBackend.Service != nil {
+		seen[ingress.Spec.DefaultBackend.Service.Name] = struct{}{}
+	}
+	for _, rule := range ingress.Spec.Rules {
+		if rule.HTTP == nil {
+			continue
+		}
+		for _, path := range rule.HTTP.Paths {
+			if path.Backend.Service != nil {
+				seen[path.Backend.Service.Name] = struct{}{}
+			}
+		}
+	}
+	names := make([]string, 0, len(seen))
+	for name := range seen {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	return names
 }
 
 func servicePorts(ports []corev1.ServicePort) []string {

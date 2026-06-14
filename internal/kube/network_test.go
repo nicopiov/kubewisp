@@ -74,3 +74,46 @@ func TestNetworkListAndDescribe(t *testing.T) {
 		t.Fatalf("ingress details = %#v, error = %v", ingress, err)
 	}
 }
+
+func TestNetworkRelationships(t *testing.T) {
+	t.Parallel()
+
+	pathType := networkingv1.PathTypePrefix
+	client := fake.NewSimpleClientset(
+		&corev1.Service{
+			ObjectMeta: metav1.ObjectMeta{Name: "api", Namespace: "apps"},
+			Spec: corev1.ServiceSpec{
+				Selector: map[string]string{"app": "api"},
+				Ports:    []corev1.ServicePort{{Name: "http", Port: 80}},
+			},
+		},
+		&corev1.Service{ObjectMeta: metav1.ObjectMeta{Name: "fallback", Namespace: "apps"}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "api-b", Namespace: "apps", Labels: map[string]string{"app": "api"}}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "api-a", Namespace: "apps", Labels: map[string]string{"app": "api"}}},
+		&corev1.Pod{ObjectMeta: metav1.ObjectMeta{Name: "worker", Namespace: "apps", Labels: map[string]string{"app": "worker"}}},
+		&networkingv1.Ingress{
+			ObjectMeta: metav1.ObjectMeta{Name: "public", Namespace: "apps"},
+			Spec: networkingv1.IngressSpec{
+				DefaultBackend: &networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{Name: "fallback"}},
+				Rules: []networkingv1.IngressRule{{
+					IngressRuleValue: networkingv1.IngressRuleValue{HTTP: &networkingv1.HTTPIngressRuleValue{
+						Paths: []networkingv1.HTTPIngressPath{
+							{Path: "/", PathType: &pathType, Backend: networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{Name: "api"}}},
+							{Path: "/v2", PathType: &pathType, Backend: networkingv1.IngressBackend{Service: &networkingv1.IngressServiceBackend{Name: "api"}}},
+						},
+					}},
+				}},
+			},
+		},
+	)
+	service := NewNetworkServiceWithFactory(fakeFactory{client: client})
+
+	pods, err := service.PodsForService(context.Background(), "apps", "api")
+	if err != nil || len(pods) != 2 || pods[0].Name != "api-a" || pods[1].Name != "api-b" {
+		t.Fatalf("PodsForService() = %#v, error = %v", pods, err)
+	}
+	services, err := service.ServicesForIngress(context.Background(), "apps", "public")
+	if err != nil || len(services) != 2 || services[0].Name != "api" || services[1].Name != "fallback" {
+		t.Fatalf("ServicesForIngress() = %#v, error = %v", services, err)
+	}
+}

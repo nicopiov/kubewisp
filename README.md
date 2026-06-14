@@ -97,6 +97,7 @@ remembers the selected profile.
 | `Tab`, `Left`, `Right` | Move between top-level screens |
 | `Up`, `Down`, `j`, `k` | Navigate lists or scroll details |
 | `Enter` | Open or select the highlighted resource |
+| `/` | Filter the current resource list |
 | `r` | Refresh the current screen |
 | `P` | Manage and switch profiles |
 | `Esc` | Return to the previous screen |
@@ -104,6 +105,11 @@ remembers the selected profile.
 
 The contextual help bar changes with the selected resource, compacts on smaller
 terminals, and wraps at action boundaries.
+
+On Namespaces, Pods, Workloads, Network, Events, and relationship lists, press
+`/` and type to filter immediately. `Enter` keeps the filter while navigating;
+`Esc` clears it. Filtering matches useful metadata such as resource kind,
+status, owner, host, reason, and message in addition to names.
 
 ### Dashboard
 
@@ -150,7 +156,13 @@ CronJobs.
 
 - Enter a replica workload for rollout details, conditions, images, and its
   managed pods.
+- Press `w` from workload details to monitor rollout generation, revision,
+  replica replacement, conditions, and pods. The monitor refreshes every two
+  seconds until the rollout completes or stalls.
+- From Pod details, press `o` to open its owning workload. Kubewisp follows
+  ReplicaSet-to-Deployment and Job-to-CronJob ownership chains.
 - Press `R` for a guarded rollout restart.
+  After confirmation, Kubewisp opens the live rollout monitor automatically.
 - Enter a CronJob for recent Jobs and scheduling details.
 - Press `s` to confirm suspend or resume.
 
@@ -161,6 +173,8 @@ or disruptive actions.
 
 The Network screen combines Services and Ingresses. Details include Service
 selectors, ready EndpointSlice addresses, Ingress routes, and Service backends.
+From Service details, press `p` to inspect selected pods. From Ingress details,
+press `s` to inspect and open backend Services.
 
 The Events screen groups repeated namespace Warning events and drills into
 affected pods and supported workloads.

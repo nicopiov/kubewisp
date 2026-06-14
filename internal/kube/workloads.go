@@ -16,15 +16,18 @@ import (
 )
 
 const (
-	restartedAtAnnotation     = "kubectl.kubernetes.io/restartedAt"
-	recentCronJobHistoryLimit = 20
+	restartedAtAnnotation        = "kubectl.kubernetes.io/restartedAt"
+	deploymentRevisionAnnotation = "deployment.kubernetes.io/revision"
+	recentCronJobHistoryLimit    = 20
 )
 
 type WorkloadService interface {
 	List(ctx context.Context, namespace string) ([]WorkloadSummary, error)
 	RolloutRestart(ctx context.Context, namespace, kind, name string) error
+	RolloutProgress(ctx context.Context, namespace, kind, name string) (RolloutProgress, error)
 	Describe(ctx context.Context, namespace, kind, name string) (WorkloadDetails, error)
 	Pods(ctx context.Context, namespace, kind, name string) ([]PodSummary, error)
+	OwnerForPod(ctx context.Context, namespace, name string) (WorkloadSummary, error)
 	DescribeCronJob(ctx context.Context, namespace, name string) (CronJobDetails, error)
 	SetCronJobSuspended(ctx context.Context, namespace, name string, suspended bool) error
 }
@@ -67,6 +70,21 @@ type WorkloadCondition struct {
 	Status  string
 	Reason  string
 	Message string
+}
+
+type RolloutProgress struct {
+	WorkloadSummary
+	Generation         int64
+	ObservedGeneration int64
+	Revision           string
+	CurrentRevision    string
+	UpdateRevision     string
+	RestartedAt        time.Time
+	Status             string
+	Reason             string
+	Message            string
+	Complete           bool
+	Pods               []PodSummary
 }
 
 type JobSummary struct {
@@ -319,6 +337,89 @@ func (s *Workloads) Pods(ctx context.Context, namespace, kind, name string) ([]P
 	return pods, nil
 }
 
+func (s *Workloads) OwnerForPod(ctx context.Context, namespace, name string) (WorkloadSummary, error) {
+	client, err := s.client()
+	if err != nil {
+		return WorkloadSummary{}, err
+	}
+	pod, err := client.CoreV1().Pods(namespace).Get(ctx, name, metav1.GetOptions{})
+	if err != nil {
+		return WorkloadSummary{}, diagnose(fmt.Sprintf("get pod %q in namespace %q", name, namespace), err)
+	}
+	owner, ok := controllerOwnerReference(pod.OwnerReferences)
+	if !ok {
+		return WorkloadSummary{}, fmt.Errorf("Pod/%s has no controller owner", name)
+	}
+	if strings.EqualFold(owner.Kind, "ReplicaSet") {
+		replicaSet, err := client.AppsV1().ReplicaSets(namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadSummary{}, diagnose(fmt.Sprintf("get replicaset %q in namespace %q", owner.Name, namespace), err)
+		}
+		owner, ok = controllerOwnerReference(replicaSet.OwnerReferences)
+		if !ok {
+			return WorkloadSummary{}, fmt.Errorf("ReplicaSet/%s has no supported workload owner", replicaSet.Name)
+		}
+	}
+	if strings.EqualFold(owner.Kind, "Job") {
+		job, err := client.BatchV1().Jobs(namespace).Get(ctx, owner.Name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadSummary{}, diagnose(fmt.Sprintf("get job %q in namespace %q", owner.Name, namespace), err)
+		}
+		owner, ok = controllerOwnerReference(job.OwnerReferences)
+		if !ok {
+			return WorkloadSummary{}, fmt.Errorf("Job/%s has no supported workload owner", job.Name)
+		}
+	}
+	return s.getWorkloadSummary(ctx, client, namespace, owner.Kind, owner.Name)
+}
+
+func (s *Workloads) getWorkloadSummary(
+	ctx context.Context,
+	client kubernetes.Interface,
+	namespace, kind, name string,
+) (WorkloadSummary, error) {
+	switch strings.ToLower(kind) {
+	case "deployment":
+		item, err := client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadSummary{}, diagnose(fmt.Sprintf("get deployment %q in namespace %q", name, namespace), err)
+		}
+		return WorkloadSummary{
+			Kind: "Deployment", Name: item.Name, Ready: item.Status.ReadyReplicas,
+			Desired: desiredReplicas(item.Spec.Replicas), Updated: item.Status.UpdatedReplicas,
+			Available: item.Status.AvailableReplicas, CreatedAt: item.CreationTimestamp.Time,
+		}, nil
+	case "statefulset":
+		item, err := client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadSummary{}, diagnose(fmt.Sprintf("get statefulset %q in namespace %q", name, namespace), err)
+		}
+		return WorkloadSummary{
+			Kind: "StatefulSet", Name: item.Name, Ready: item.Status.ReadyReplicas,
+			Desired: desiredReplicas(item.Spec.Replicas), Updated: item.Status.UpdatedReplicas,
+			Available: item.Status.AvailableReplicas, CreatedAt: item.CreationTimestamp.Time,
+		}, nil
+	case "daemonset":
+		item, err := client.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadSummary{}, diagnose(fmt.Sprintf("get daemonset %q in namespace %q", name, namespace), err)
+		}
+		return WorkloadSummary{
+			Kind: "DaemonSet", Name: item.Name, Ready: item.Status.NumberReady,
+			Desired: item.Status.DesiredNumberScheduled, Updated: item.Status.UpdatedNumberScheduled,
+			Available: item.Status.NumberAvailable, CreatedAt: item.CreationTimestamp.Time,
+		}, nil
+	case "cronjob":
+		item, err := client.BatchV1().CronJobs(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return WorkloadSummary{}, diagnose(fmt.Sprintf("get cronjob %q in namespace %q", name, namespace), err)
+		}
+		return summarizeCronJob(item), nil
+	default:
+		return WorkloadSummary{}, fmt.Errorf("%s/%s is not a supported workload owner", kind, name)
+	}
+}
+
 func (s *Workloads) DescribeCronJob(ctx context.Context, namespace, name string) (CronJobDetails, error) {
 	client, err := s.client()
 	if err != nil {
@@ -414,6 +515,140 @@ func (s *Workloads) RolloutRestart(ctx context.Context, namespace, kind, name st
 	return nil
 }
 
+func (s *Workloads) RolloutProgress(ctx context.Context, namespace, kind, name string) (RolloutProgress, error) {
+	client, err := s.client()
+	if err != nil {
+		return RolloutProgress{}, err
+	}
+	var progress RolloutProgress
+	var selector *metav1.LabelSelector
+	var annotations map[string]string
+	switch strings.ToLower(kind) {
+	case "deployment", "deployments":
+		item, err := client.AppsV1().Deployments(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return RolloutProgress{}, diagnose(fmt.Sprintf("get deployment %q in namespace %q", name, namespace), err)
+		}
+		progress = RolloutProgress{
+			WorkloadSummary: WorkloadSummary{
+				Kind: "Deployment", Name: item.Name, Ready: item.Status.ReadyReplicas,
+				Desired: desiredReplicas(item.Spec.Replicas), Updated: item.Status.UpdatedReplicas,
+				Available: item.Status.AvailableReplicas, CreatedAt: item.CreationTimestamp.Time,
+			},
+			Generation: item.Generation, ObservedGeneration: item.Status.ObservedGeneration,
+			Revision: item.Annotations[deploymentRevisionAnnotation],
+		}
+		selector = item.Spec.Selector
+		annotations = item.Spec.Template.Annotations
+		progress.Status, progress.Reason, progress.Message = deploymentRolloutCondition(item.Status.Conditions)
+	case "statefulset", "statefulsets":
+		item, err := client.AppsV1().StatefulSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return RolloutProgress{}, diagnose(fmt.Sprintf("get statefulset %q in namespace %q", name, namespace), err)
+		}
+		progress = RolloutProgress{
+			WorkloadSummary: WorkloadSummary{
+				Kind: "StatefulSet", Name: item.Name, Ready: item.Status.ReadyReplicas,
+				Desired: desiredReplicas(item.Spec.Replicas), Updated: item.Status.UpdatedReplicas,
+				Available: item.Status.AvailableReplicas, CreatedAt: item.CreationTimestamp.Time,
+			},
+			Generation: item.Generation, ObservedGeneration: item.Status.ObservedGeneration,
+			CurrentRevision: item.Status.CurrentRevision, UpdateRevision: item.Status.UpdateRevision,
+		}
+		selector = item.Spec.Selector
+		annotations = item.Spec.Template.Annotations
+	case "daemonset", "daemonsets":
+		item, err := client.AppsV1().DaemonSets(namespace).Get(ctx, name, metav1.GetOptions{})
+		if err != nil {
+			return RolloutProgress{}, diagnose(fmt.Sprintf("get daemonset %q in namespace %q", name, namespace), err)
+		}
+		progress = RolloutProgress{
+			WorkloadSummary: WorkloadSummary{
+				Kind: "DaemonSet", Name: item.Name, Ready: item.Status.NumberReady,
+				Desired: item.Status.DesiredNumberScheduled, Updated: item.Status.UpdatedNumberScheduled,
+				Available: item.Status.NumberAvailable, CreatedAt: item.CreationTimestamp.Time,
+			},
+			Generation: item.Generation, ObservedGeneration: item.Status.ObservedGeneration,
+		}
+		selector = item.Spec.Selector
+		annotations = item.Spec.Template.Annotations
+	default:
+		return RolloutProgress{}, fmt.Errorf("workload kind %q does not support rollout progress", kind)
+	}
+	progress.RestartedAt = restartedAt(annotations)
+	progress.Complete = rolloutComplete(progress)
+	if progress.Complete {
+		progress.Status = "Complete"
+	} else if progress.Status == "" {
+		progress.Status = "Progressing"
+	}
+	pods, err := podsForSelector(ctx, client, namespace, selector)
+	if err != nil {
+		return RolloutProgress{}, err
+	}
+	progress.Pods = pods
+	return progress, nil
+}
+
+func restartedAt(annotations map[string]string) time.Time {
+	value := annotations[restartedAtAnnotation]
+	parsed, _ := time.Parse(time.RFC3339, value)
+	return parsed
+}
+
+func rolloutComplete(progress RolloutProgress) bool {
+	complete := progress.ObservedGeneration >= progress.Generation &&
+		progress.Updated >= progress.Desired &&
+		progress.Ready >= progress.Desired &&
+		progress.Available >= progress.Desired
+	if strings.EqualFold(progress.Kind, "StatefulSet") &&
+		progress.CurrentRevision != "" && progress.UpdateRevision != "" {
+		complete = complete && progress.CurrentRevision == progress.UpdateRevision
+	}
+	return complete
+}
+
+func deploymentRolloutCondition(conditions []appsv1.DeploymentCondition) (string, string, string) {
+	for _, condition := range conditions {
+		if condition.Type != appsv1.DeploymentProgressing {
+			continue
+		}
+		status := "Progressing"
+		if condition.Reason == "ProgressDeadlineExceeded" {
+			status = "Stalled"
+		}
+		return status, condition.Reason, condition.Message
+	}
+	return "", "", ""
+}
+
+func podsForSelector(
+	ctx context.Context,
+	client kubernetes.Interface,
+	namespace string,
+	selector *metav1.LabelSelector,
+) ([]PodSummary, error) {
+	if selector == nil {
+		return nil, nil
+	}
+	labelSelector, err := metav1.LabelSelectorAsSelector(selector)
+	if err != nil {
+		return nil, fmt.Errorf("build rollout pod selector: %w", err)
+	}
+	list, err := client.CoreV1().Pods(namespace).List(ctx, metav1.ListOptions{LabelSelector: labelSelector.String()})
+	if err != nil {
+		return nil, diagnose(fmt.Sprintf("list rollout pods in namespace %q", namespace), err)
+	}
+	pods := make([]PodSummary, 0, len(list.Items))
+	for index := range list.Items {
+		pods = append(pods, summarizePod(&list.Items[index]))
+	}
+	sort.Slice(pods, func(i, j int) bool {
+		return pods[i].CreatedAt.After(pods[j].CreatedAt)
+	})
+	return pods, nil
+}
+
 func summarizeCronJob(item *batchv1.CronJob) WorkloadSummary {
 	return WorkloadSummary{
 		Kind:               "CronJob",
@@ -481,6 +716,15 @@ func ownedBy(references []metav1.OwnerReference, kind, name string) bool {
 		}
 	}
 	return false
+}
+
+func controllerOwnerReference(references []metav1.OwnerReference) (metav1.OwnerReference, bool) {
+	for _, reference := range references {
+		if reference.Controller != nil && *reference.Controller {
+			return reference, true
+		}
+	}
+	return metav1.OwnerReference{}, false
 }
 
 func (s *Workloads) client() (kubernetes.Interface, error) {
