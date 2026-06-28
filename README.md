@@ -13,7 +13,7 @@ access. Kubewisp never stores Google credentials or Secret values.
 - Automatic expired-session reauthentication
 - Live profile and namespace switching
 - Responsive dashboard with cluster, pod-health, and dependency cards
-- Pod details, logs, exec, port-forward, guarded delete, and restart
+- Pod details, YAML preview, logs, exec, port-forward, guarded delete, and restart
 - Deployment, StatefulSet, DaemonSet, and CronJob visibility
 - Guarded rollout restart and CronJob suspend/resume
 - Workload-to-pod drill-down
@@ -97,7 +97,8 @@ remembers the selected profile.
 | `Tab`, `Left`, `Right` | Move between top-level screens |
 | `Up`, `Down`, `j`, `k` | Navigate lists or scroll details |
 | `Enter` | Open or select the highlighted resource |
-| `/` | Filter the current resource list |
+| `/` | Filter resource lists or search inside scrollable detail views |
+| `c` | Copy the selected resource, useful address/host, or focused text line |
 | `r` | Refresh the current screen |
 | `P` | Manage and switch profiles |
 | `Esc` | Return to the previous screen |
@@ -117,6 +118,21 @@ On Namespaces, Pods, Workloads, Network, Events, and relationship lists, press
 `/` and type to filter immediately. `Enter` keeps the filter while navigating;
 `Esc` clears it. Filtering matches useful metadata such as resource kind,
 status, owner, host, reason, and message in addition to names.
+
+On scrollable detail views such as YAML, logs, diagnostics, rollout status, and
+resource details, press `/` to search within the current text. `Enter` applies
+the search, `n` jumps to the next match, `N` jumps to the previous match, and
+`Esc` clears it. Matching text is highlighted in the current view.
+The active match uses a stronger highlight and the search status shows the
+current match index, such as `2/5`.
+
+On resource lists and details, press `c` to copy the most useful value for the
+current context. Lists copy the selected resource name or `Kind/name`, Service
+details copy the address when available, Ingress details copy the first host
+when available, and scrollable YAML/log/diagnostic views copy the focused
+search match line or current top line. Wrapped display lines copy the full
+original line to the clipboard, while the status message shows a shortened
+preview.
 
 ### Dashboard
 
@@ -146,6 +162,7 @@ cached cluster data, and reloads the dashboard.
 | Key | Action |
 | --- | --- |
 | `Enter` | Open curated troubleshooting details |
+| `y` | View read-only resource YAML from details |
 | `l` | View the latest 200 log lines |
 | `p` | Start `kubectl port-forward` |
 | `e` | Open a guarded `kubectl exec` shell |
@@ -162,6 +179,10 @@ sensitive values.
 Press `v` from Pod details for resource-aware diagnostics. Kubewisp combines
 container states, restart history, failed conditions, and Warning events into a
 short likely-cause summary without exposing environment or Secret values.
+Press `y` from Pod, Workload, CronJob, Service, or Ingress details to inspect
+the read-only Kubernetes YAML for the selected resource.
+Detail screens also include compact related Warning events when Kubernetes
+allows event access; if event listing is blocked, the main details still render.
 
 ### Workloads
 
@@ -176,6 +197,7 @@ list.
   seconds until the rollout completes or stalls.
 - Press `v` from replica-workload details to diagnose the workload together
   with warnings from its selected pods.
+- Press `y` from workload or CronJob details to inspect the read-only YAML.
 - From Pod details, press `o` to open its owning workload. Kubewisp follows
   ReplicaSet-to-Deployment and Job-to-CronJob ownership chains.
 - Press `R` for a guarded rollout restart.
@@ -191,7 +213,8 @@ or disruptive actions.
 The Network screen combines Services and Ingresses. Details include Service
 selectors, ready EndpointSlice addresses, Ingress routes, and Service backends.
 From Service details, press `p` to inspect selected pods. From Ingress details,
-press `s` to inspect and open backend Services.
+press `s` to inspect and open backend Services. Press `y` from Service or
+Ingress details to inspect the read-only YAML.
 
 The Events screen groups repeated namespace Warning events and drills into
 affected pods and supported workloads.

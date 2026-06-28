@@ -23,6 +23,7 @@ func main() {
 	workloads := kube.NewWorkloadServiceWithFactory(clientFactory)
 	events := kube.NewEventServiceWithFactory(clientFactory)
 	network := kube.NewNetworkServiceWithFactory(clientFactory)
+	resourceYAML := kube.NewResourceYAMLServiceWithFactory(clientFactory)
 	commandRunner := runner.NewOSRunner()
 	profileConnector := gcloud.NewProfileConnector(gcloud.NewClient(commandRunner), connectivity, clientFactory)
 	doctorReporter := doctor.NewService(commandRunner)
@@ -37,7 +38,7 @@ func main() {
 		PortForward:  kubectlService,
 		Exec:         kubectlService,
 		Selector:     selector.NewTerminal(),
-		TUI:          tui.NewRunner(connectivity, namespaces, pods, workloads, network, events, doctorReporter, kubectlService, kubectlService, profileConnector),
+		TUI:          tui.NewRunner(connectivity, namespaces, pods, workloads, network, events, resourceYAML, doctorReporter, kubectlService, kubectlService, profileConnector),
 		Version:      buildVersion(),
 	})
 

@@ -28,6 +28,7 @@ const (
 	networkScreen
 	eventScreen
 	podDetailsScreen
+	resourceYAMLScreen
 	podLogsScreen
 	containerScreen
 	portForwardScreen
@@ -59,10 +60,12 @@ type Dependencies struct {
 	Workloads    kube.WorkloadService
 	Network      kube.NetworkService
 	Events       kube.EventService
+	YAML         kube.ResourceYAMLService
 	Doctor       doctor.Reporter
 	PortForward  kubectl.PortForwarder
 	Exec         kubectl.Executor
 	Profiles     ProfileConnector
+	Clipboard    Clipboard
 }
 
 type Model struct {
@@ -81,11 +84,18 @@ type Model struct {
 	filtering    bool
 	filterQuery  string
 	filterScreen screen
+	searching    bool
+	searchQuery  string
+	searchScreen screen
 
 	connectivity         kube.ConnectivityReport
 	namespaces           []string
 	pods                 []kube.PodSummary
 	podDetails           kube.PodDetails
+	resourceYAML         string
+	resourceYAMLKind     string
+	resourceYAMLName     string
+	resourceYAMLBack     screen
 	logs                 string
 	containers           []string
 	selectedPod          string
@@ -102,6 +112,8 @@ type Model struct {
 	parentNetwork        kube.NetworkSummary
 	parentNetworkDetails kube.NetworkDetails
 	events               []kube.NamespaceEventSummary
+	relatedEvents        []kube.NamespaceEventSummary
+	relatedEventsErr     error
 	selectedWorkload     kube.WorkloadSummary
 	workloadDetails      kube.WorkloadDetails
 	rolloutProgress      kube.RolloutProgress
@@ -144,7 +156,14 @@ type namespaceSwitchedMsg struct {
 }
 
 type podDetailsMsg struct {
-	details kube.PodDetails
+	details          kube.PodDetails
+	relatedEvents    []kube.NamespaceEventSummary
+	relatedEventsErr error
+	err              error
+}
+
+type resourceYAMLMsg struct {
+	content string
 	err     error
 }
 
@@ -218,8 +237,10 @@ type podOwnerWorkloadMsg struct {
 }
 
 type networkDetailsMsg struct {
-	details kube.NetworkDetails
-	err     error
+	details          kube.NetworkDetails
+	relatedEvents    []kube.NamespaceEventSummary
+	relatedEventsErr error
+	err              error
 }
 
 type eventsMsg struct {
@@ -237,13 +258,17 @@ type workloadRestartedMsg struct {
 }
 
 type cronJobDetailsMsg struct {
-	details kube.CronJobDetails
-	err     error
+	details          kube.CronJobDetails
+	relatedEvents    []kube.NamespaceEventSummary
+	relatedEventsErr error
+	err              error
 }
 
 type workloadDetailsMsg struct {
-	details kube.WorkloadDetails
-	err     error
+	details          kube.WorkloadDetails
+	relatedEvents    []kube.NamespaceEventSummary
+	relatedEventsErr error
+	err              error
 }
 
 type rolloutProgressMsg struct {
@@ -281,15 +306,17 @@ type profileDeletedMsg struct {
 }
 
 var (
-	titleStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	activeTabStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
-	errorStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
-	warningStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
-	healthyStyle   = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
-	mutedStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
-	helpKeyStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
-	helpGroupStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250"))
-	tableHeadStyle = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250"))
+	titleStyle       = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	activeTabStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("42"))
+	errorStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("196"))
+	warningStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("214"))
+	healthyStyle     = lipgloss.NewStyle().Foreground(lipgloss.Color("42"))
+	mutedStyle       = lipgloss.NewStyle().Foreground(lipgloss.Color("244"))
+	helpKeyStyle     = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("63"))
+	helpGroupStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250"))
+	searchHitStyle   = lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("63")).Foreground(lipgloss.Color("230"))
+	searchFocusStyle = lipgloss.NewStyle().Bold(true).Background(lipgloss.Color("214")).Foreground(lipgloss.Color("230"))
+	tableHeadStyle   = lipgloss.NewStyle().Bold(true).Foreground(lipgloss.Color("250"))
 )
 
 type tableColumn struct {
@@ -306,8 +333,8 @@ func NewModel(dependencies Dependencies) Model {
 	return Model{
 		dependencies: dependencies, loading: true, podBackScreen: podScreen,
 		workloadBackScreen: workloadScreen, rolloutBackScreen: workloadScreen, networkBackScreen: networkScreen,
-		diagnosticBackScreen: podDetailsScreen,
-		loadedAt:             make(map[screen]time.Time), cacheTTL: 15 * time.Second, now: time.Now,
+		diagnosticBackScreen: podDetailsScreen, resourceYAMLBack: podDetailsScreen,
+		loadedAt: make(map[screen]time.Time), cacheTTL: 15 * time.Second, now: time.Now,
 	}
 }
 
@@ -377,6 +404,8 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = message.err
 		m.networkDetails = message.details
+		m.relatedEvents = message.relatedEvents
+		m.relatedEventsErr = message.relatedEventsErr
 	case ingressServicesMsg:
 		m.loading = false
 		m.err = message.err
@@ -404,6 +433,12 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = message.err
 		m.podDetails = message.details
+		m.relatedEvents = message.relatedEvents
+		m.relatedEventsErr = message.relatedEventsErr
+	case resourceYAMLMsg:
+		m.loading = false
+		m.err = message.err
+		m.resourceYAML = message.content
 	case containersMsg:
 		m.loading = false
 		m.err = message.err
@@ -489,10 +524,14 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 		m.loading = false
 		m.err = message.err
 		m.cronJobDetails = message.details
+		m.relatedEvents = message.relatedEvents
+		m.relatedEventsErr = message.relatedEventsErr
 	case workloadDetailsMsg:
 		m.loading = false
 		m.err = message.err
 		m.workloadDetails = message.details
+		m.relatedEvents = message.relatedEvents
+		m.relatedEventsErr = message.relatedEventsErr
 	case rolloutProgressMsg:
 		m.loading = false
 		m.err = message.err
@@ -575,6 +614,32 @@ func (m Model) Update(message tea.Msg) (tea.Model, tea.Cmd) {
 }
 
 func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
+	if m.searching {
+		switch key.String() {
+		case "ctrl+c", "esc":
+			m.clearSearch()
+			return m, nil
+		case "enter":
+			m.searching = false
+			return m, nil
+		case "backspace":
+			runes := []rune(m.searchQuery)
+			if len(runes) > 0 {
+				m.searchQuery = string(runes[:len(runes)-1])
+				m.scroll = 0
+				m.jumpToFirstSearchMatch()
+			}
+			return m, nil
+		default:
+			if key.Type == tea.KeyRunes {
+				m.searchQuery += string(key.Runes)
+				m.searchScreen = m.screen
+				m.scroll = 0
+				m.jumpToFirstSearchMatch()
+			}
+			return m, nil
+		}
+	}
 	if m.filtering {
 		switch key.String() {
 		case "ctrl+c":
@@ -697,7 +762,19 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.err = nil
 			return m, nil
 		}
+		if m.isSearchableScreen() {
+			m.searching = true
+			m.searchScreen = m.screen
+			m.searchQuery = ""
+			m.status = ""
+			m.err = nil
+			return m, nil
+		}
 	case "esc":
+		if m.searchQuery != "" && m.searchScreen == m.screen {
+			m.clearSearch()
+			return m, nil
+		}
 		if m.filterQuery != "" && m.filterScreen == m.screen {
 			m.clearFilter()
 			return m, nil
@@ -724,6 +801,8 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 				m.screen = m.diagnosticBackScreen
 			} else if m.screen == workloadPodsScreen {
 				m.screen = workloadDetailsScreen
+			} else if m.screen == resourceYAMLScreen {
+				m.screen = m.resourceYAMLBack
 			} else if m.screen == podDetailsScreen || m.screen == podLogsScreen || m.screen == containerScreen {
 				m.screen = m.podBackScreen
 			} else {
@@ -768,7 +847,8 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "up", "k":
 		if m.screen == podDetailsScreen || m.screen == podLogsScreen ||
 			m.screen == workloadDetailsScreen || m.screen == workloadRolloutScreen ||
-			m.screen == resourceDiagnosticsScreen || m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
+			m.screen == resourceDiagnosticsScreen || m.screen == resourceYAMLScreen ||
+			m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
 			if m.scroll > 0 {
 				m.scroll--
 			}
@@ -780,12 +860,27 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 	case "down", "j":
 		if m.screen == podDetailsScreen || m.screen == podLogsScreen ||
 			m.screen == workloadDetailsScreen || m.screen == workloadRolloutScreen ||
-			m.screen == resourceDiagnosticsScreen || m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
+			m.screen == resourceDiagnosticsScreen || m.screen == resourceYAMLScreen ||
+			m.screen == networkDetailsScreen || m.screen == cronJobDetailsScreen {
 			m.scroll++
 			return m, nil
 		}
 		if m.cursor < m.itemCount()-1 {
 			m.cursor++
+		}
+	case "n":
+		if m.searchQuery != "" && m.searchScreen == m.screen {
+			m.jumpToSearchMatch(1)
+			return m, nil
+		}
+	case "N":
+		if m.searchQuery != "" && m.searchScreen == m.screen {
+			m.jumpToSearchMatch(-1)
+			return m, nil
+		}
+	case "c":
+		if m.canCopy() {
+			return m.copyCurrent()
 		}
 	case "l":
 		if (m.screen == podScreen && len(m.visiblePods()) > 0) ||
@@ -861,6 +956,22 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.scroll = 0
 			m.loading = true
 			return m, m.loadDiagnostics(m.selectedWorkload.Kind, m.selectedWorkload.Name)
+		}
+	case "y":
+		if m.canOpenResourceYAML() {
+			return m.openResourceYAML()
+		}
+		if m.screen == execConfirmScreen && m.dependencies.Profile.Production {
+			return m.startExec()
+		}
+		if m.screen == podActionConfirmScreen && !m.dependencies.Profile.Production {
+			return m.executePodAction()
+		}
+		if m.screen == workloadRestartConfirmScreen && !m.dependencies.Profile.Production {
+			return m.executeWorkloadRestart()
+		}
+		if m.screen == cronJobStateConfirmScreen && !m.dependencies.Profile.Production {
+			return m.executeCronJobState()
 		}
 	case "e":
 		if (m.screen == podScreen && len(m.visiblePods()) > 0) || m.screen == podDetailsScreen {
@@ -948,19 +1059,6 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 			m.status = ""
 			m.err = nil
 			return m, m.loadPodOwnerWorkload()
-		}
-	case "y":
-		if m.screen == execConfirmScreen && m.dependencies.Profile.Production {
-			return m.startExec()
-		}
-		if m.screen == podActionConfirmScreen && !m.dependencies.Profile.Production {
-			return m.executePodAction()
-		}
-		if m.screen == workloadRestartConfirmScreen && !m.dependencies.Profile.Production {
-			return m.executeWorkloadRestart()
-		}
-		if m.screen == cronJobStateConfirmScreen && !m.dependencies.Profile.Production {
-			return m.executeCronJobState()
 		}
 	case "enter":
 		if m.screen == profileScreen && len(m.profileNames) > 0 {
@@ -1096,6 +1194,7 @@ func (m Model) handleKey(key tea.KeyMsg) (tea.Model, tea.Cmd) {
 func (m Model) changeScreen(next screen) (tea.Model, tea.Cmd) {
 	if next != m.screen {
 		m.clearFilter()
+		m.clearSearch()
 	}
 	m.screen = next
 	m.cursor = 0
@@ -1133,6 +1232,8 @@ func (m Model) View() string {
 			view.WriteString(m.workloadPodsView())
 		case resourceDiagnosticsScreen:
 			view.WriteString(m.scrollView(m.resourceDiagnosticsView()))
+		case resourceYAMLScreen:
+			view.WriteString(m.scrollView(m.resourceYAMLView()))
 		case servicePodsScreen:
 			view.WriteString(m.servicePodsView())
 		case workloadScreen:
@@ -1187,6 +1288,11 @@ func (m Model) View() string {
 		view.WriteString(m.filterView())
 		view.WriteString("\n")
 	}
+	if m.searching || (m.searchQuery != "" && m.searchScreen == m.screen) {
+		view.WriteString("\n")
+		view.WriteString(m.searchView())
+		view.WriteString("\n")
+	}
 	body := strings.TrimRight(m.wrapContent(view.String()), "\n")
 	footer := m.responsiveHelpView()
 	gap := 1
@@ -1228,6 +1334,9 @@ func (m Model) tabs() string {
 }
 
 func (m Model) helpView() string {
+	if m.searching {
+		return "Input: type search | backspace edit | enter apply\nGeneral: esc cancel"
+	}
 	if m.filtering {
 		return "Input: type filter | backspace edit | enter apply\nGeneral: esc cancel"
 	}
@@ -1274,13 +1383,13 @@ func (m Model) contextualHelpGroups() (string, string) {
 		navigate = ""
 	case namespaceScreen:
 		navigate += " | enter switch"
-		actions = "/ filter"
+		actions = "/ filter | c copy"
 	case podScreen:
 		navigate += " | enter details"
-		actions = "/ filter | l logs | p port-forward | e exec | d delete | R restart"
+		actions = "/ filter | c copy | l logs | p port-forward | e exec | d delete | R restart"
 	case workloadScreen:
 		navigate += " | enter details"
-		actions = "/ filter"
+		actions = "/ filter | c copy"
 		workloads := m.visibleWorkloads()
 		if m.cursor < len(workloads) && strings.EqualFold(workloads[m.cursor].Kind, "CronJob") {
 			actions += " | s suspend/resume"
@@ -1289,41 +1398,45 @@ func (m Model) contextualHelpGroups() (string, string) {
 		}
 	case networkScreen:
 		navigate += " | enter details"
-		actions = "/ filter"
+		actions = "/ filter | c copy"
 	case eventScreen:
 		navigate += " | enter inspect"
-		actions = "/ filter"
+		actions = "/ filter | c copy"
 	case podDetailsScreen:
 		navigate = "up/down scroll"
-		actions = "v diagnostics | o owner | l logs | p port-forward | e exec | d delete | R restart"
+		actions = "/ search | n next | N previous | c copy | y yaml | v diagnostics | o owner | l logs | p port-forward | e exec | d delete | R restart"
 	case workloadDetailsScreen:
 		navigate = "up/down scroll"
-		actions = "v diagnostics | w watch rollout | p managed pods | R rollout restart"
+		actions = "/ search | n next | N previous | c copy | y yaml | v diagnostics | w watch rollout | p managed pods | R rollout restart"
 	case workloadRolloutScreen:
 		navigate = "up/down scroll"
 		if rolloutStillRunning(m.rolloutProgress) {
-			actions = "auto-refreshing every 2s"
+			actions = "/ search | n next | N previous | c copy | auto-refreshing every 2s"
 		} else {
-			actions = "monitor stopped"
+			actions = "/ search | n next | N previous | c copy | monitor stopped"
 		}
 	case workloadPodsScreen, servicePodsScreen:
 		navigate += " | enter details"
-		actions = "/ filter | l logs"
+		actions = "/ filter | c copy | l logs"
 	case ingressServicesScreen:
 		navigate += " | enter details"
-		actions = "/ filter"
+		actions = "/ filter | c copy"
 	case networkDetailsScreen:
 		navigate = "up/down scroll"
 		if strings.EqualFold(m.selectedNetwork.Kind, "Service") {
-			actions = "p selected pods"
+			actions = "/ search | n next | N previous | c copy | y yaml | p selected pods"
 		} else if strings.EqualFold(m.selectedNetwork.Kind, "Ingress") {
-			actions = "s backend services"
+			actions = "/ search | n next | N previous | c copy | y yaml | s backend services"
 		}
 	case cronJobDetailsScreen:
 		navigate = "up/down scroll"
-		actions = "s suspend/resume"
+		actions = "/ search | n next | N previous | c copy | y yaml | s suspend/resume"
+	case resourceYAMLScreen:
+		navigate = "up/down scroll"
+		actions = "/ search | n next | N previous | c copy line"
 	case resourceDiagnosticsScreen, podLogsScreen:
 		navigate = "up/down scroll"
+		actions = "/ search | n next | N previous | c copy line"
 	case containerScreen, execContainerScreen, portForwardScreen:
 		navigate += " | enter select"
 	case profileScreen:
@@ -1822,7 +1935,36 @@ func (m Model) podDetailsView() string {
 	if len(details.Events) == 0 {
 		fmt.Fprintln(&view, "  -")
 	}
+	writeRelatedWarningEvents(&view, m.relatedEvents, m.relatedEventsErr)
 	return view.String()
+}
+
+func writeRelatedWarningEvents(
+	view *strings.Builder,
+	events []kube.NamespaceEventSummary,
+	err error,
+) {
+	fmt.Fprintln(view, "\nRelated Warning Events:")
+	if err != nil {
+		fmt.Fprintf(view, "  Warning events unavailable: %s\n", err)
+		return
+	}
+	if len(events) == 0 {
+		fmt.Fprintln(view, "  -")
+		return
+	}
+	for _, event := range events {
+		fmt.Fprintf(
+			view,
+			"  %s/%s | %s | count=%d | last=%s\n    %s\n",
+			event.ObjectKind,
+			event.ObjectName,
+			event.Reason,
+			event.Count,
+			formatAge(time.Now(), event.LastSeen),
+			event.Message,
+		)
+	}
 }
 
 func writeDetailSection(view *strings.Builder, title string, values []string) {
@@ -1846,8 +1988,18 @@ func (m Model) podLogsView() string {
 	return fmt.Sprintf("Logs: %s (latest 200 lines)\n\n%s", m.selectedPod, m.logs)
 }
 
+func (m Model) resourceYAMLView() string {
+	return fmt.Sprintf(
+		"YAML: %s/%s\n\n%s",
+		m.resourceYAMLKind,
+		m.resourceYAMLName,
+		strings.TrimRight(m.resourceYAML, "\n"),
+	)
+}
+
 func (m Model) scrollView(content string) string {
 	content = m.wrapContent(content)
+	content = m.highlightSearchMatches(content)
 	lines := strings.Split(content, "\n")
 	visible := m.height - 9
 	if visible <= 0 || len(lines) <= visible {
@@ -1858,11 +2010,329 @@ func (m Model) scrollView(content string) string {
 		"\n\n" + mutedStyle.Render(fmt.Sprintf("lines %d-%d of %d", scroll+1, scroll+visible, len(lines)))
 }
 
+func (m Model) highlightSearchMatches(content string) string {
+	if m.searchScreen != m.screen || strings.TrimSpace(m.searchQuery) == "" {
+		return content
+	}
+	query := strings.ToLower(strings.TrimSpace(m.searchQuery))
+	lines := strings.Split(content, "\n")
+	focusedLine := m.focusedSearchLine()
+	for index, line := range lines {
+		style := searchHitStyle
+		if index == focusedLine {
+			style = searchFocusStyle
+		}
+		lines[index] = highlightLineMatches(line, query, style)
+	}
+	return strings.Join(lines, "\n")
+}
+
+func highlightLineMatches(line, query string, style lipgloss.Style) string {
+	if query == "" {
+		return line
+	}
+	lower := strings.ToLower(line)
+	var highlighted strings.Builder
+	offset := 0
+	for {
+		index := strings.Index(lower[offset:], query)
+		if index < 0 {
+			highlighted.WriteString(line[offset:])
+			break
+		}
+		index += offset
+		highlighted.WriteString(line[offset:index])
+		end := index + len(query)
+		highlighted.WriteString(style.Render(line[index:end]))
+		offset = end
+	}
+	return highlighted.String()
+}
+
 func (m Model) wrapContent(content string) string {
 	if m.width <= 0 {
 		return content
 	}
 	return ansi.Wrap(content, m.width, "")
+}
+
+func (m Model) searchableContent() string {
+	switch m.screen {
+	case podDetailsScreen:
+		return m.podDetailsView()
+	case resourceYAMLScreen:
+		return m.resourceYAMLView()
+	case podLogsScreen:
+		return m.podLogsView()
+	case workloadDetailsScreen:
+		return m.workloadDetailsView()
+	case workloadRolloutScreen:
+		return m.workloadRolloutView()
+	case resourceDiagnosticsScreen:
+		return m.resourceDiagnosticsView()
+	case networkDetailsScreen:
+		return m.networkDetailsView()
+	case cronJobDetailsScreen:
+		return m.cronJobDetailsView()
+	default:
+		return ""
+	}
+}
+
+func (m Model) searchableLines() []string {
+	lines, _ := m.searchableLinesWithSourceIndexes()
+	return lines
+}
+
+func (m Model) sourceSearchableLines() []string {
+	content := m.searchableContent()
+	if content == "" {
+		return nil
+	}
+	return strings.Split(content, "\n")
+}
+
+func (m Model) searchableLinesWithSourceIndexes() ([]string, []int) {
+	sourceLines := m.sourceSearchableLines()
+	if len(sourceLines) == 0 {
+		return nil, nil
+	}
+	lines := make([]string, 0, len(sourceLines))
+	indexes := make([]int, 0, len(sourceLines))
+	for index, line := range sourceLines {
+		wrapped := line
+		if m.width > 0 {
+			wrapped = ansi.Wrap(line, m.width, "")
+		}
+		parts := strings.Split(wrapped, "\n")
+		for _, part := range parts {
+			lines = append(lines, part)
+			indexes = append(indexes, index)
+		}
+	}
+	return lines, indexes
+}
+
+func (m Model) searchMatchLines() []int {
+	if m.searchScreen != m.screen || strings.TrimSpace(m.searchQuery) == "" {
+		return nil
+	}
+	query := strings.ToLower(strings.TrimSpace(m.searchQuery))
+	lines := m.searchableLines()
+	matches := make([]int, 0)
+	for index, line := range lines {
+		if strings.Contains(strings.ToLower(line), query) {
+			matches = append(matches, index)
+		}
+	}
+	return matches
+}
+
+func (m *Model) jumpToSearchMatch(direction int) {
+	matches := m.searchMatchLines()
+	if len(matches) == 0 {
+		return
+	}
+	if direction < 0 {
+		for index := len(matches) - 1; index >= 0; index-- {
+			if matches[index] < m.scroll {
+				m.scroll = matches[index]
+				return
+			}
+		}
+		m.scroll = matches[len(matches)-1]
+		return
+	}
+	for _, match := range matches {
+		if match > m.scroll {
+			m.scroll = match
+			return
+		}
+	}
+	m.scroll = matches[0]
+}
+
+func (m *Model) jumpToFirstSearchMatch() {
+	matches := m.searchMatchLines()
+	if len(matches) == 0 {
+		m.scroll = 0
+		return
+	}
+	m.scroll = matches[0]
+}
+
+func (m Model) focusedSearchLine() int {
+	matches := m.searchMatchLines()
+	if len(matches) == 0 {
+		return -1
+	}
+	for _, match := range matches {
+		if match == m.scroll {
+			return match
+		}
+	}
+	for _, match := range matches {
+		if match > m.scroll {
+			return match
+		}
+	}
+	return matches[0]
+}
+
+func (m Model) searchMatchPosition() (int, int) {
+	matches := m.searchMatchLines()
+	if len(matches) == 0 {
+		return 0, 0
+	}
+	focused := m.focusedSearchLine()
+	for index, match := range matches {
+		if match == focused {
+			return index + 1, len(matches)
+		}
+	}
+	return 1, len(matches)
+}
+
+type copyTarget struct {
+	label string
+	value string
+}
+
+func (m Model) canCopy() bool {
+	target := m.copyTarget()
+	return target.value != ""
+}
+
+func (m Model) copyCurrent() (tea.Model, tea.Cmd) {
+	target := m.copyTarget()
+	if target.value == "" {
+		m.status = "Nothing to copy on this screen"
+		return m, nil
+	}
+	if m.dependencies.Clipboard == nil {
+		m.status = "Clipboard is not available"
+		return m, nil
+	}
+	if err := m.dependencies.Clipboard.Copy(target.value); err != nil {
+		m.err = fmt.Errorf("copy %s: %w", target.label, err)
+		m.status = ""
+		return m, nil
+	}
+	m.err = nil
+	m.status = fmt.Sprintf("Copied %s to clipboard: %s", target.label, copyPreview(target.value))
+	return m, nil
+}
+
+func (m Model) copyTarget() copyTarget {
+	switch m.screen {
+	case namespaceScreen:
+		namespaces := m.visibleNamespaces()
+		if m.cursor < len(namespaces) {
+			return copyTarget{label: "namespace", value: namespaces[m.cursor]}
+		}
+	case podScreen:
+		return podCopyTarget(m.visiblePods(), m.cursor)
+	case workloadPodsScreen:
+		return podCopyTarget(m.visibleWorkloadPods(), m.cursor)
+	case servicePodsScreen:
+		return podCopyTarget(m.visibleServicePods(), m.cursor)
+	case podDetailsScreen:
+		return copyTarget{label: "pod", value: m.selectedPod}
+	case workloadScreen:
+		workloads := m.visibleWorkloads()
+		if m.cursor < len(workloads) {
+			return copyTarget{label: "workload", value: workloadReference(workloads[m.cursor])}
+		}
+	case workloadDetailsScreen, workloadRolloutScreen, cronJobDetailsScreen:
+		return copyTarget{label: "workload", value: workloadReference(m.selectedWorkload)}
+	case networkScreen:
+		return networkCopyTarget(m.visibleNetworkResources(), m.cursor)
+	case ingressServicesScreen:
+		return networkCopyTarget(m.visibleIngressServices(), m.cursor)
+	case networkDetailsScreen:
+		return m.networkDetailsCopyTarget()
+	case eventScreen:
+		events := m.visibleEvents()
+		if m.cursor < len(events) {
+			event := events[m.cursor]
+			return copyTarget{label: "event object", value: event.ObjectKind + "/" + event.ObjectName}
+		}
+	case resourceYAMLScreen, podLogsScreen, resourceDiagnosticsScreen:
+		if line := m.currentCopyLine(); line != "" {
+			return copyTarget{label: "line", value: line}
+		}
+	}
+	return copyTarget{}
+}
+
+func podCopyTarget(pods []kube.PodSummary, cursor int) copyTarget {
+	if cursor >= len(pods) {
+		return copyTarget{}
+	}
+	return copyTarget{label: "pod", value: pods[cursor].Name}
+}
+
+func networkCopyTarget(resources []kube.NetworkSummary, cursor int) copyTarget {
+	if cursor >= len(resources) {
+		return copyTarget{}
+	}
+	resource := resources[cursor]
+	return copyTarget{label: "resource", value: networkReference(resource)}
+}
+
+func (m Model) networkDetailsCopyTarget() copyTarget {
+	details := m.networkDetails
+	if strings.EqualFold(details.Kind, "Service") && usefulCopyValue(details.Address) {
+		return copyTarget{label: "service address", value: strings.TrimSpace(details.Address)}
+	}
+	if strings.EqualFold(details.Kind, "Ingress") {
+		for _, host := range details.Hosts {
+			if usefulCopyValue(host) {
+				return copyTarget{label: "ingress host", value: strings.TrimSpace(host)}
+			}
+		}
+	}
+	return copyTarget{label: "resource", value: networkReference(details.NetworkSummary)}
+}
+
+func (m Model) currentCopyLine() string {
+	displayLines, sourceIndexes := m.searchableLinesWithSourceIndexes()
+	sourceLines := m.sourceSearchableLines()
+	if len(displayLines) == 0 || len(sourceLines) == 0 {
+		return ""
+	}
+	index := m.scroll
+	if m.searchQuery != "" && m.searchScreen == m.screen {
+		if focused := m.focusedSearchLine(); focused >= 0 {
+			index = focused
+		}
+	}
+	if index < 0 {
+		index = 0
+	}
+	if index >= len(displayLines) {
+		index = len(displayLines) - 1
+	}
+	sourceIndex := sourceIndexes[index]
+	if sourceIndex < 0 || sourceIndex >= len(sourceLines) {
+		return ""
+	}
+	return strings.TrimSpace(ansi.Strip(sourceLines[sourceIndex]))
+}
+
+func usefulCopyValue(value string) bool {
+	value = strings.TrimSpace(value)
+	return value != "" && value != "-" && !strings.EqualFold(value, "none")
+}
+
+func copyPreview(value string) string {
+	const maxRunes = 80
+	value = strings.TrimSpace(strings.ReplaceAll(value, "\n", " "))
+	runes := []rune(value)
+	if len(runes) <= maxRunes {
+		return value
+	}
+	return string(runes[:maxRunes-3]) + "..."
 }
 
 func (m Model) containerView() string {
@@ -2006,6 +2476,7 @@ func (m Model) workloadDetailsView() string {
 			valueOrDash(condition.Message),
 		)
 	}
+	writeRelatedWarningEvents(&view, m.relatedEvents, m.relatedEventsErr)
 	return view.String()
 }
 
@@ -2101,6 +2572,7 @@ func (m Model) networkDetailsView() string {
 	writeDetailSection(&view, "Selector", details.Selector)
 	writeDetailSection(&view, "Ready Endpoints", details.Endpoints)
 	writeDetailSection(&view, "Routes", details.Routes)
+	writeRelatedWarningEvents(&view, m.relatedEvents, m.relatedEventsErr)
 	return view.String()
 }
 
@@ -2128,6 +2600,7 @@ func (m Model) cronJobDetailsView() string {
 			formatAge(time.Now(), job.CreatedAt),
 		)
 	}
+	writeRelatedWarningEvents(&view, m.relatedEvents, m.relatedEventsErr)
 	return view.String()
 }
 
@@ -2283,6 +2756,8 @@ func (m Model) loadCurrent() tea.Cmd {
 		return m.loadWorkloadPods()
 	case resourceDiagnosticsScreen:
 		return m.loadDiagnostics(m.diagnostics.ResourceKind, m.diagnostics.ResourceName)
+	case resourceYAMLScreen:
+		return m.loadResourceYAML()
 	case servicePodsScreen:
 		return m.loadServicePods()
 	case networkDetailsScreen:
@@ -2332,7 +2807,14 @@ func (m Model) loadWorkloadDetails() tea.Cmd {
 			m.selectedWorkload.Kind,
 			m.selectedWorkload.Name,
 		)
-		return workloadDetailsMsg{details: details, err: err}
+		events, eventsErr := m.relatedWarnings(
+			context.Background(),
+			namespace,
+			m.selectedWorkload.Kind,
+			m.selectedWorkload.Name,
+			m.workloadPods,
+		)
+		return workloadDetailsMsg{details: details, relatedEvents: events, relatedEventsErr: eventsErr, err: err}
 	}
 }
 
@@ -2344,6 +2826,62 @@ func (m Model) loadDiagnostics(kind, name string) tea.Cmd {
 		}
 		report, err := m.dependencies.Events.Diagnose(context.Background(), namespace, kind, name)
 		return diagnosticsMsg{report: report, err: err}
+	}
+}
+
+func (m Model) loadResourceYAML() tea.Cmd {
+	namespace := selectedNamespace(m.dependencies.Profile)
+	return func() tea.Msg {
+		if m.dependencies.YAML == nil {
+			return resourceYAMLMsg{err: errors.New("Kubernetes YAML service is not configured")}
+		}
+		content, err := m.dependencies.YAML.Get(
+			context.Background(),
+			namespace,
+			m.resourceYAMLKind,
+			m.resourceYAMLName,
+		)
+		return resourceYAMLMsg{content: content, err: err}
+	}
+}
+
+func (m Model) canOpenResourceYAML() bool {
+	switch m.screen {
+	case podDetailsScreen, workloadDetailsScreen, cronJobDetailsScreen, networkDetailsScreen:
+		return true
+	default:
+		return false
+	}
+}
+
+func (m Model) openResourceYAML() (tea.Model, tea.Cmd) {
+	kind, name := m.currentResourceYAMLTarget()
+	if kind == "" || name == "" {
+		m.status = "No resource YAML available for this screen"
+		return m, nil
+	}
+	m.resourceYAMLKind = kind
+	m.resourceYAMLName = name
+	m.resourceYAML = ""
+	m.resourceYAMLBack = m.screen
+	m.screen = resourceYAMLScreen
+	m.scroll = 0
+	m.loading = true
+	m.status = ""
+	m.err = nil
+	return m, m.loadResourceYAML()
+}
+
+func (m Model) currentResourceYAMLTarget() (string, string) {
+	switch m.screen {
+	case podDetailsScreen:
+		return "Pod", m.selectedPod
+	case workloadDetailsScreen, cronJobDetailsScreen:
+		return m.selectedWorkload.Kind, m.selectedWorkload.Name
+	case networkDetailsScreen:
+		return m.selectedNetwork.Kind, m.selectedNetwork.Name
+	default:
+		return "", ""
 	}
 }
 
@@ -2384,7 +2922,14 @@ func (m Model) loadCronJobDetails() tea.Cmd {
 			return cronJobDetailsMsg{err: errors.New("Kubernetes workload service is not configured")}
 		}
 		details, err := m.dependencies.Workloads.DescribeCronJob(context.Background(), namespace, m.selectedWorkload.Name)
-		return cronJobDetailsMsg{details: details, err: err}
+		events, eventsErr := m.relatedWarnings(
+			context.Background(),
+			namespace,
+			m.selectedWorkload.Kind,
+			m.selectedWorkload.Name,
+			nil,
+		)
+		return cronJobDetailsMsg{details: details, relatedEvents: events, relatedEventsErr: eventsErr, err: err}
 	}
 }
 
@@ -2468,7 +3013,14 @@ func (m Model) loadNetworkDetails() tea.Cmd {
 		details, err := m.dependencies.Network.Describe(
 			context.Background(), namespace, m.selectedNetwork.Kind, m.selectedNetwork.Name,
 		)
-		return networkDetailsMsg{details: details, err: err}
+		events, eventsErr := m.relatedWarnings(
+			context.Background(),
+			namespace,
+			m.selectedNetwork.Kind,
+			m.selectedNetwork.Name,
+			nil,
+		)
+		return networkDetailsMsg{details: details, relatedEvents: events, relatedEventsErr: eventsErr, err: err}
 	}
 }
 
@@ -2481,6 +3033,45 @@ func (m Model) loadEvents() tea.Cmd {
 		events, err := m.dependencies.Events.ListWarnings(context.Background(), namespace)
 		return eventsMsg{events: events, err: err}
 	}
+}
+
+func (m Model) relatedWarnings(
+	ctx context.Context,
+	namespace, kind, name string,
+	knownPods []kube.PodSummary,
+) ([]kube.NamespaceEventSummary, error) {
+	if m.dependencies.Events == nil {
+		return nil, errors.New("Kubernetes event service is not configured")
+	}
+	events, err := m.dependencies.Events.ListWarnings(ctx, namespace)
+	if err != nil {
+		return nil, err
+	}
+	return filterRelatedWarnings(events, kind, name, knownPods), nil
+}
+
+func filterRelatedWarnings(
+	events []kube.NamespaceEventSummary,
+	kind, name string,
+	knownPods []kube.PodSummary,
+) []kube.NamespaceEventSummary {
+	pods := make(map[string]struct{}, len(knownPods))
+	for _, pod := range knownPods {
+		pods[pod.Name] = struct{}{}
+	}
+	related := make([]kube.NamespaceEventSummary, 0)
+	for _, event := range events {
+		if strings.EqualFold(event.ObjectKind, kind) && event.ObjectName == name {
+			related = append(related, event)
+			continue
+		}
+		if strings.EqualFold(event.ObjectKind, "Pod") {
+			if _, ok := pods[event.ObjectName]; ok {
+				related = append(related, event)
+			}
+		}
+	}
+	return related
 }
 
 func (m Model) loadProfiles() tea.Cmd {
@@ -2588,7 +3179,8 @@ func (m Model) loadPodDetails() tea.Cmd {
 	namespace := selectedNamespace(m.dependencies.Profile)
 	return func() tea.Msg {
 		details, err := m.dependencies.Pods.Describe(context.Background(), namespace, m.selectedPod)
-		return podDetailsMsg{details: details, err: err}
+		events, eventsErr := m.relatedWarnings(context.Background(), namespace, "Pod", m.selectedPod, nil)
+		return podDetailsMsg{details: details, relatedEvents: events, relatedEventsErr: eventsErr, err: err}
 	}
 }
 
@@ -2689,11 +3281,28 @@ func (m Model) isFilterableScreen() bool {
 	}
 }
 
+func (m Model) isSearchableScreen() bool {
+	switch m.screen {
+	case podDetailsScreen, resourceYAMLScreen, podLogsScreen,
+		workloadDetailsScreen, workloadRolloutScreen, resourceDiagnosticsScreen,
+		networkDetailsScreen, cronJobDetailsScreen:
+		return true
+	default:
+		return false
+	}
+}
+
 func (m *Model) clearFilter() {
 	m.filtering = false
 	m.filterQuery = ""
 	m.filterScreen = dashboardScreen
 	m.cursor = 0
+}
+
+func (m *Model) clearSearch() {
+	m.searching = false
+	m.searchQuery = ""
+	m.searchScreen = dashboardScreen
 }
 
 func (m Model) filterView() string {
@@ -2707,6 +3316,27 @@ func (m Model) filterView() string {
 		state,
 		m.itemCount(),
 		m.unfilteredItemCount(),
+	))
+}
+
+func (m Model) searchView() string {
+	editing := ""
+	if m.searching {
+		editing = " (editing)"
+	}
+	if strings.TrimSpace(m.searchQuery) == "" {
+		return activeTabStyle.Render("Search /" + m.searchQuery + editing)
+	}
+	current, total := m.searchMatchPosition()
+	if total == 0 {
+		return activeTabStyle.Render(fmt.Sprintf("Search /%s%s (0 matches)", m.searchQuery, editing))
+	}
+	return activeTabStyle.Render(fmt.Sprintf(
+		"Search /%s%s (%d/%d matches, n next, N previous)",
+		m.searchQuery,
+		editing,
+		current,
+		total,
 	))
 }
 
@@ -2846,6 +3476,7 @@ func (m Model) isConfirmationScreen() bool {
 
 func (m Model) isNestedTarget(target screen) bool {
 	return target == podDetailsScreen || target == podLogsScreen ||
+		target == resourceYAMLScreen ||
 		target == containerScreen || target == portForwardScreen ||
 		target == execContainerScreen || target == execConfirmScreen ||
 		target == podActionConfirmScreen || target == workloadRestartConfirmScreen ||
@@ -2874,6 +3505,10 @@ func (m *Model) resetClusterData() {
 	m.namespaces = nil
 	m.pods = nil
 	m.podDetails = kube.PodDetails{}
+	m.resourceYAML = ""
+	m.resourceYAMLKind = ""
+	m.resourceYAMLName = ""
+	m.resourceYAMLBack = podDetailsScreen
 	m.logs = ""
 	m.containers = nil
 	m.workloads = nil
@@ -2892,6 +3527,8 @@ func (m *Model) resetClusterData() {
 	m.rolloutBackScreen = workloadScreen
 	m.networkBackScreen = networkScreen
 	m.events = nil
+	m.relatedEvents = nil
+	m.relatedEventsErr = nil
 	m.loadedAt = make(map[screen]time.Time)
 	m.cursor = 0
 	m.scroll = 0
@@ -2983,6 +3620,10 @@ func recentlyRestarted(pod kube.PodSummary, now time.Time) bool {
 
 func workloadReference(workload kube.WorkloadSummary) string {
 	return workload.Kind + "/" + workload.Name
+}
+
+func networkReference(resource kube.NetworkSummary) string {
+	return resource.Kind + "/" + resource.Name
 }
 
 func workloadStatusMarker(workload kube.WorkloadSummary) string {

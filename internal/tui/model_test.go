@@ -48,7 +48,14 @@ type fakeWorkloads struct {
 
 type fakeEvents struct {
 	items       []kube.NamespaceEventSummary
+	listErr     error
 	diagnostics kube.ResourceDiagnostics
+}
+
+type fakeResourceYAML struct {
+	content string
+	kind    string
+	name    string
 }
 
 type fakeNetwork struct {
@@ -75,11 +82,20 @@ func (f fakeNetwork) ServicesForIngress(context.Context, string, string) ([]kube
 }
 
 func (f fakeEvents) ListWarnings(context.Context, string) ([]kube.NamespaceEventSummary, error) {
+	if f.listErr != nil {
+		return nil, f.listErr
+	}
 	return f.items, nil
 }
 
 func (f fakeEvents) Diagnose(context.Context, string, string, string) (kube.ResourceDiagnostics, error) {
 	return f.diagnostics, nil
+}
+
+func (f *fakeResourceYAML) Get(_ context.Context, _, kind, name string) (string, error) {
+	f.kind = kind
+	f.name = name
+	return f.content, nil
 }
 
 func (f fakeWorkloads) List(context.Context, string) ([]kube.WorkloadSummary, error) {
@@ -154,6 +170,16 @@ type fakeExecutor struct {
 
 type fakeProfileConnector struct {
 	profile config.Profile
+}
+
+type fakeClipboard struct {
+	copied string
+	err    error
+}
+
+func (f *fakeClipboard) Copy(text string) error {
+	f.copied = text
+	return f.err
 }
 
 func (f *fakeProfileConnector) Connect(_ context.Context, profile config.Profile) error {
@@ -306,6 +332,7 @@ func testDependencies(t *testing.T) Dependencies {
 			Count:      2,
 			LastSeen:   time.Now().Add(-time.Hour),
 		}}},
+		YAML: &fakeResourceYAML{content: "apiVersion: v1\nkind: Pod\nmetadata:\n  name: api-abc\n"},
 		Doctor: fakeDoctor{report: doctor.Report{Checks: []doctor.Check{{
 			Dependency: doctor.Dependency{Name: "gcloud", Description: "Google Cloud CLI"},
 			Path:       "/usr/local/bin/gcloud",
@@ -313,6 +340,7 @@ func testDependencies(t *testing.T) Dependencies {
 		PortForward: &fakePortForwarder{},
 		Exec:        &fakeExecutor{},
 		Profiles:    &fakeProfileConnector{},
+		Clipboard:   &fakeClipboard{},
 		Pods: fakePods{pods: []kube.PodSummary{{
 			Name:      "api-abc",
 			Ready:     "1/1",
@@ -1587,6 +1615,283 @@ func TestPodAndWorkloadDetailsOpenDiagnostics(t *testing.T) {
 	}
 }
 
+func TestDetailsShowRelatedWarningEvents(t *testing.T) {
+	t.Parallel()
+
+	dependencies := testDependencies(t)
+	dependencies.Events = fakeEvents{items: []kube.NamespaceEventSummary{{
+		ObjectKind: "Pod",
+		ObjectName: "api-abc",
+		Reason:     "BackOff",
+		Message:    "Back-off restarting failed container",
+		Count:      4,
+		LastSeen:   time.Now().Add(-time.Minute),
+	}, {
+		ObjectKind: "Deployment",
+		ObjectName: "api",
+		Reason:     "FailedCreate",
+		Message:    "quota exceeded",
+		Count:      2,
+		LastSeen:   time.Now().Add(-2 * time.Minute),
+	}, {
+		ObjectKind: "Service",
+		ObjectName: "api",
+		Reason:     "Unhealthy",
+		Message:    "no ready endpoints",
+		Count:      1,
+		LastSeen:   time.Now().Add(-3 * time.Minute),
+	}, {
+		ObjectKind: "Pod",
+		ObjectName: "worker-abc",
+		Reason:     "BackOff",
+		Message:    "unrelated worker failure",
+		Count:      7,
+		LastSeen:   time.Now().Add(-4 * time.Minute),
+	}}}
+
+	model := NewModel(dependencies)
+	model.screen = podDetailsScreen
+	model.selectedPod = "api-abc"
+	updated, _ := model.Update(model.loadPodDetails()())
+	podDetails := updated.(Model)
+	if !strings.Contains(podDetails.View(), "Related Warning Events") ||
+		!strings.Contains(podDetails.View(), "Pod/api-abc | BackOff | count=4") ||
+		strings.Contains(podDetails.View(), "worker-abc") {
+		t.Fatalf("pod details related warnings unexpected:\n%s", podDetails.View())
+	}
+
+	model = NewModel(dependencies)
+	model.screen = workloadDetailsScreen
+	model.selectedWorkload = kube.WorkloadSummary{Kind: "Deployment", Name: "api"}
+	model.workloadPods = []kube.PodSummary{{Name: "api-abc"}}
+	updated, _ = model.Update(model.loadWorkloadDetails()())
+	workloadDetails := updated.(Model)
+	for _, want := range []string{
+		"Deployment/api | FailedCreate | count=2",
+		"Pod/api-abc | BackOff | count=4",
+	} {
+		if !strings.Contains(workloadDetails.View(), want) {
+			t.Fatalf("workload details missing %q:\n%s", want, workloadDetails.View())
+		}
+	}
+	if strings.Contains(workloadDetails.View(), "worker-abc") {
+		t.Fatalf("workload details included unrelated pod warning:\n%s", workloadDetails.View())
+	}
+
+	model = NewModel(dependencies)
+	model.screen = networkDetailsScreen
+	model.selectedNetwork = kube.NetworkSummary{Kind: "Service", Name: "api"}
+	updated, _ = model.Update(model.loadNetworkDetails()())
+	networkDetails := updated.(Model)
+	if !strings.Contains(networkDetails.View(), "Service/api | Unhealthy | count=1") {
+		t.Fatalf("network details missing service warning:\n%s", networkDetails.View())
+	}
+}
+
+func TestDetailsKeepRenderingWhenRelatedWarningsAreUnavailable(t *testing.T) {
+	t.Parallel()
+
+	dependencies := testDependencies(t)
+	dependencies.Events = fakeEvents{listErr: errors.New("events forbidden")}
+	model := NewModel(dependencies)
+	model.screen = workloadDetailsScreen
+	model.selectedWorkload = kube.WorkloadSummary{Kind: "Deployment", Name: "api"}
+
+	updated, _ := model.Update(model.loadWorkloadDetails()())
+	view := updated.(Model).View()
+	if !strings.Contains(view, "Deployment Details: api") ||
+		!strings.Contains(view, "Warning events unavailable: events forbidden") {
+		t.Fatalf("details did not keep rendering with warning event error:\n%s", view)
+	}
+}
+
+func TestResourceDetailsOpenYAMLPreview(t *testing.T) {
+	t.Parallel()
+
+	yaml := &fakeResourceYAML{
+		content: "apiVersion: apps/v1\nkind: Deployment\nmetadata:\n  name: api\nspec:\n  replicas: 2\n",
+	}
+	dependencies := testDependencies(t)
+	dependencies.YAML = yaml
+	model := NewModel(dependencies)
+	model.screen = workloadDetailsScreen
+	model.loading = false
+	model.selectedWorkload = kube.WorkloadSummary{Kind: "Deployment", Name: "api"}
+	model.height = 20
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	if command == nil {
+		t.Fatal("y did not load resource YAML")
+	}
+	updated, _ = updated.(Model).Update(command())
+	preview := updated.(Model)
+	if preview.screen != resourceYAMLScreen || yaml.kind != "Deployment" || yaml.name != "api" {
+		t.Fatalf("unexpected YAML preview state: model=%#v target=%s/%s", preview, yaml.kind, yaml.name)
+	}
+	for _, want := range []string{"YAML: Deployment/api", "apiVersion: apps/v1", "replicas: 2"} {
+		if !strings.Contains(preview.View(), want) {
+			t.Fatalf("YAML preview missing %q:\n%s", want, preview.View())
+		}
+	}
+
+	updated, _ = preview.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	if updated.(Model).screen != workloadDetailsScreen {
+		t.Fatalf("Esc screen = %d, want workloadDetailsScreen", updated.(Model).screen)
+	}
+}
+
+func TestResourceYAMLPreviewScrolls(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = resourceYAMLScreen
+	model.loading = false
+	model.width = 80
+	model.height = 12
+	model.resourceYAMLKind = "Deployment"
+	model.resourceYAMLName = "api"
+	model.resourceYAML = strings.Join([]string{
+		"apiVersion: apps/v1",
+		"kind: Deployment",
+		"metadata:",
+		"  name: api",
+		"spec:",
+		"  replicas: 2",
+	}, "\n")
+
+	view := model.View()
+	if !strings.Contains(view, "lines 1-") {
+		t.Fatalf("YAML preview did not show scroll position:\n%s", view)
+	}
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyDown})
+	scrolled := updated.(Model)
+	if scrolled.scroll != 1 || !strings.Contains(scrolled.View(), "lines 2-") {
+		t.Fatalf("YAML preview did not scroll: scroll=%d\n%s", scrolled.scroll, scrolled.View())
+	}
+	updated, _ = scrolled.Update(tea.KeyMsg{Type: tea.KeyUp})
+	if updated.(Model).scroll != 0 {
+		t.Fatalf("YAML preview did not scroll back up: scroll=%d", updated.(Model).scroll)
+	}
+}
+
+func TestScrollableViewSearchJumpsBetweenMatches(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = resourceYAMLScreen
+	model.loading = false
+	model.height = 12
+	model.resourceYAMLKind = "Deployment"
+	model.resourceYAMLName = "api"
+	model.resourceYAML = strings.Join([]string{
+		"apiVersion: apps/v1",
+		"kind: Deployment",
+		"metadata:",
+		"  name: api",
+		"spec:",
+		"  template:",
+		"    spec:",
+		"      containers:",
+		"      - name: app",
+		"        image: example/api:v1",
+		"      - name: sidecar",
+		"        image: example/sidecar:v1",
+	}, "\n")
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	searching := updated.(Model)
+	if command != nil || !searching.searching || searching.filtering {
+		t.Fatalf("slash did not start scrollable search: %#v", searching)
+	}
+	updated, _ = searching.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune("image")})
+	found := updated.(Model)
+	if !found.searching || found.searchQuery != "image" || found.scroll == 0 ||
+		!strings.Contains(found.View(), "Search /image (editing) (1/2 matches") {
+		t.Fatalf("search did not jump to first match: %#v\n%s", found, found.View())
+	}
+	if !searchHitStyle.GetBold() || !searchFocusStyle.GetBold() {
+		t.Fatal("search match styles should emphasize matches")
+	}
+	if searchHitStyle.GetBackground() == searchFocusStyle.GetBackground() {
+		t.Fatal("focused search match should use a distinct background")
+	}
+	for _, line := range strings.Split(found.View(), "\n") {
+		if found.width > 0 && lipgloss.Width(line) > found.width {
+			t.Fatalf("highlighted search line width = %d, want <= %d: %q", lipgloss.Width(line), found.width, line)
+		}
+	}
+
+	updated, _ = found.Update(tea.KeyMsg{Type: tea.KeyEnter})
+	applied := updated.(Model)
+	if applied.searching || applied.searchQuery != "image" {
+		t.Fatalf("Enter did not apply search: %#v", applied)
+	}
+	firstMatch := applied.scroll
+
+	updated, _ = applied.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'n'}})
+	next := updated.(Model)
+	if next.scroll <= firstMatch {
+		t.Fatalf("n did not move to next match: first=%d next=%d", firstMatch, next.scroll)
+	}
+	if !strings.Contains(next.View(), "Search /image (2/2 matches") {
+		t.Fatalf("next search status missing current match index:\n%s", next.View())
+	}
+	updated, _ = next.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'N'}})
+	previous := updated.(Model)
+	if previous.scroll != firstMatch {
+		t.Fatalf("N did not move to previous match: got %d, want %d", previous.scroll, firstMatch)
+	}
+	if !strings.Contains(previous.View(), "Search /image (1/2 matches") {
+		t.Fatalf("previous search status missing current match index:\n%s", previous.View())
+	}
+
+	updated, _ = previous.Update(tea.KeyMsg{Type: tea.KeyEsc})
+	cleared := updated.(Model)
+	if cleared.searchQuery != "" || cleared.searching {
+		t.Fatalf("Esc did not clear search: %#v", cleared)
+	}
+}
+
+func TestSlashStillFiltersListScreens(t *testing.T) {
+	t.Parallel()
+
+	model := NewModel(testDependencies(t))
+	model.screen = podScreen
+	model.loading = false
+	model.pods = []kube.PodSummary{{Name: "api"}}
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'/'}})
+	filtering := updated.(Model)
+	if command != nil || !filtering.filtering || filtering.searching {
+		t.Fatalf("slash did not start list filtering: %#v", filtering)
+	}
+}
+
+func TestNetworkAndCronJobDetailsOpenYAMLTargets(t *testing.T) {
+	t.Parallel()
+
+	yaml := &fakeResourceYAML{content: "kind: Service\nmetadata:\n  name: api\n"}
+	dependencies := testDependencies(t)
+	dependencies.YAML = yaml
+	model := NewModel(dependencies)
+	model.screen = networkDetailsScreen
+	model.selectedNetwork = kube.NetworkSummary{Kind: "Service", Name: "api"}
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	updated, _ = updated.(Model).Update(command())
+	if yaml.kind != "Service" || yaml.name != "api" || updated.(Model).screen != resourceYAMLScreen {
+		t.Fatalf("service YAML target = %s/%s, screen=%d", yaml.kind, yaml.name, updated.(Model).screen)
+	}
+
+	model.screen = cronJobDetailsScreen
+	model.selectedWorkload = kube.WorkloadSummary{Kind: "CronJob", Name: "cleanup"}
+	updated, command = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'y'}})
+	updated, _ = updated.(Model).Update(command())
+	if yaml.kind != "CronJob" || yaml.name != "cleanup" || updated.(Model).screen != resourceYAMLScreen {
+		t.Fatalf("cronjob YAML target = %s/%s, screen=%d", yaml.kind, yaml.name, updated.(Model).screen)
+	}
+}
+
 func TestPodAndWorkloadListsShowWarningCounts(t *testing.T) {
 	t.Parallel()
 
@@ -1758,6 +2063,119 @@ func TestProductionWorkloadRestartRequiresExactReference(t *testing.T) {
 	updated, _ = updated.(Model).Update(command())
 	if restarted != "Deployment/api" {
 		t.Fatalf("restarted = %q", restarted)
+	}
+}
+
+func TestCopySelectedResource(t *testing.T) {
+	t.Parallel()
+
+	clipboard := &fakeClipboard{}
+	dependencies := testDependencies(t)
+	dependencies.Clipboard = clipboard
+	model := NewModel(dependencies)
+	model.screen = workloadScreen
+	model.loading = false
+	model.workloads = []kube.WorkloadSummary{{Kind: "Deployment", Name: "api"}}
+
+	updated, command := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	final := updated.(Model)
+	if command != nil || clipboard.copied != "Deployment/api" {
+		t.Fatalf("copied = %q, command=%v", clipboard.copied, command)
+	}
+	if !strings.Contains(final.status, "Copied workload to clipboard: Deployment/api") {
+		t.Fatalf("copy status = %q", final.status)
+	}
+	if !strings.Contains(final.helpView(), "c copy") {
+		t.Fatalf("help missing copy action:\n%s", final.helpView())
+	}
+}
+
+func TestCopyNetworkDetailsPrefersUsefulAddressOrHost(t *testing.T) {
+	t.Parallel()
+
+	clipboard := &fakeClipboard{}
+	dependencies := testDependencies(t)
+	dependencies.Clipboard = clipboard
+	model := NewModel(dependencies)
+	model.screen = networkDetailsScreen
+	model.selectedNetwork = kube.NetworkSummary{Kind: "Service", Name: "api"}
+	model.networkDetails = kube.NetworkDetails{NetworkSummary: kube.NetworkSummary{
+		Kind: "Service", Name: "api", Address: "10.0.0.1",
+	}}
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if clipboard.copied != "10.0.0.1" || !strings.Contains(updated.(Model).status, "service address") {
+		t.Fatalf("service copy = %q, status=%q", clipboard.copied, updated.(Model).status)
+	}
+
+	model.networkDetails = kube.NetworkDetails{NetworkSummary: kube.NetworkSummary{
+		Kind: "Ingress", Name: "public", Hosts: []string{"api.example.com"},
+	}}
+	updated, _ = model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if clipboard.copied != "api.example.com" || !strings.Contains(updated.(Model).status, "ingress host") {
+		t.Fatalf("ingress copy = %q, status=%q", clipboard.copied, updated.(Model).status)
+	}
+}
+
+func TestCopySearchFocusedLine(t *testing.T) {
+	t.Parallel()
+
+	clipboard := &fakeClipboard{}
+	dependencies := testDependencies(t)
+	dependencies.Clipboard = clipboard
+	model := NewModel(dependencies)
+	model.screen = resourceYAMLScreen
+	model.loading = false
+	model.resourceYAMLKind = "Deployment"
+	model.resourceYAMLName = "api"
+	model.resourceYAML = strings.Join([]string{
+		"apiVersion: apps/v1",
+		"kind: Deployment",
+		"spec:",
+		"  template:",
+		"    spec:",
+		"      containers:",
+		"      - image: example/api:v1",
+		"      - image: example/worker:v1",
+	}, "\n")
+	model.searchScreen = resourceYAMLScreen
+	model.searchQuery = "image"
+	model.jumpToFirstSearchMatch()
+	model.jumpToSearchMatch(1)
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if clipboard.copied != "- image: example/worker:v1" {
+		t.Fatalf("copied line = %q", clipboard.copied)
+	}
+	if !strings.Contains(updated.(Model).status, "Copied line to clipboard") {
+		t.Fatalf("copy status = %q", updated.(Model).status)
+	}
+}
+
+func TestCopyWrappedLogLineCopiesFullSourceLine(t *testing.T) {
+	t.Parallel()
+
+	clipboard := &fakeClipboard{}
+	dependencies := testDependencies(t)
+	dependencies.Clipboard = clipboard
+	model := NewModel(dependencies)
+	model.screen = podLogsScreen
+	model.loading = false
+	model.width = 28
+	model.selectedPod = "api-abc"
+	fullLine := "2026-06-28T10:00:00Z request_id=abc123 path=/api/orders status=500 duration_ms=1200 message=upstream timeout"
+	model.logs = fullLine
+	model.scroll = 3
+
+	updated, _ := model.Update(tea.KeyMsg{Type: tea.KeyRunes, Runes: []rune{'c'}})
+	if clipboard.copied != fullLine {
+		t.Fatalf("copied wrapped line = %q, want full source line %q", clipboard.copied, fullLine)
+	}
+	if !strings.Contains(updated.(Model).status, "Copied line to clipboard") {
+		t.Fatalf("copy status = %q", updated.(Model).status)
+	}
+	if strings.Contains(updated.(Model).status, "upstream timeout") {
+		t.Fatalf("copy status should show a shortened preview, got %q", updated.(Model).status)
 	}
 }
 

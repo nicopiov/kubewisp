@@ -29,6 +29,7 @@ type Runner struct {
 	workloads    kube.WorkloadService
 	network      kube.NetworkService
 	events       kube.EventService
+	yaml         kube.ResourceYAMLService
 	doctor       doctor.Reporter
 	portForward  kubectl.PortForwarder
 	exec         kubectl.Executor
@@ -42,6 +43,7 @@ func NewRunner(
 	workloads kube.WorkloadService,
 	network kube.NetworkService,
 	events kube.EventService,
+	yaml kube.ResourceYAMLService,
 	doctorReporter doctor.Reporter,
 	portForwarder kubectl.PortForwarder,
 	executor kubectl.Executor,
@@ -54,6 +56,7 @@ func NewRunner(
 		workloads:    workloads,
 		network:      network,
 		events:       events,
+		yaml:         yaml,
 		doctor:       doctorReporter,
 		portForward:  portForwarder,
 		exec:         executor,
@@ -88,10 +91,12 @@ func (r *Runner) Run(ctx context.Context, input io.Reader, output io.Writer, con
 		Workloads:    r.workloads,
 		Network:      r.network,
 		Events:       r.events,
+		YAML:         r.yaml,
 		Doctor:       r.doctor,
 		PortForward:  r.portForward,
 		Exec:         r.exec,
 		Profiles:     r.profiles,
+		Clipboard:    NewOSC52Clipboard(output),
 	})
 
 	_, err = tea.NewProgram(
